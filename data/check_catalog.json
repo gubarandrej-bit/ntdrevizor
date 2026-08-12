@@ -1,0 +1,149 @@
+{
+  "version": "1.0.0",
+  "updated": "2026-08-12",
+  "systems": [
+    {"code": "ES", "name": "Электроснабжение"},
+    {"code": "EO", "name": "Электроосвещение"},
+    {"code": "PS", "name": "Пожарная сигнализация"},
+    {"code": "SOUE", "name": "СОУЭ"},
+    {"code": "PT", "name": "Пожаротушение"},
+    {"code": "SKS", "name": "СКС"},
+    {"code": "LVS", "name": "ЛВС"},
+    {"code": "VOLS", "name": "ВОЛС"},
+    {"code": "CCTV", "name": "Видеонаблюдение"},
+    {"code": "SKUD", "name": "СКУД"},
+    {"code": "OS", "name": "Охранная сигнализация"},
+    {"code": "ASU", "name": "АСУ"},
+    {"code": "ASUTP", "name": "АСУТП"}
+  ],
+  "checks": [
+    {
+      "code": "NTD_ACTUALITY",
+      "title": "Актуальность нормативно-технических документов",
+      "group": "подготовка",
+      "requires": [],
+      "ai": false
+    },
+    {
+      "code": "DOC_COMPLETENESS",
+      "title": "Комплектность проектной и рабочей документации",
+      "group": "документация",
+      "requires": [],
+      "ai": false
+    },
+    {
+      "code": "SPEC_VS_JOURNAL_NAMES",
+      "title": "Кабельный журнал ↔ спецификация (наименования и марки)",
+      "group": "сверки",
+      "requires": ["specification", "cable_journal"],
+      "ai": false
+    },
+    {
+      "code": "SPEC_VS_JOURNAL_QTY",
+      "title": "Кабельный журнал ↔ спецификация (количества и длины)",
+      "group": "сверки",
+      "requires": ["specification", "cable_journal"],
+      "ai": false
+    },
+    {
+      "code": "SCHEME_VS_SPEC",
+      "title": "Оборудование на схемах ↔ спецификация",
+      "group": "сверки",
+      "requires": ["specification", "scheme"],
+      "ai": false
+    },
+    {
+      "code": "PLAN_LENGTH_VS_JOURNAL",
+      "title": "Длины трасс на планах ↔ кабельный журнал (с учётом способа прокладки)",
+      "group": "сверки",
+      "requires": ["cable_journal", "plan"],
+      "ai": false
+    },
+    {
+      "code": "CABLE_MARK",
+      "title": "Выбор марки кабеля по назначению системы и НТД",
+      "group": "кабели",
+      "requires": ["cable_or_spec"],
+      "ai": false
+    },
+    {
+      "code": "CABLE_SECTION",
+      "title": "Выбор сечения кабеля по нагрузке и ПУЭ/ГОСТ/СП",
+      "group": "кабели",
+      "requires": ["cable_or_spec", "loads"],
+      "ai": false
+    },
+    {
+      "code": "PROTECTION_COORD",
+      "title": "Согласование сечения кабеля и аппарата защиты",
+      "group": "кабели",
+      "requires": ["cable_or_spec", "protection"],
+      "ai": false
+    },
+    {
+      "code": "LAYING_METHOD",
+      "title": "Способ прокладки и допустимость марки кабеля",
+      "group": "кабели",
+      "requires": ["cable_journal"],
+      "ai": false
+    },
+    {
+      "code": "SPZ_FIRE_RESIST",
+      "title": "Огнестойкость линий систем противопожарной защиты",
+      "group": "пожарная безопасность",
+      "requires": ["cable_or_spec"],
+      "systems": ["PS", "SOUE", "PT"],
+      "ai": false
+    },
+    {
+      "code": "POWER_SOURCE",
+      "title": "Расчёт источников питания по току и мощности",
+      "group": "питание",
+      "requires": ["loads_or_calc"],
+      "ai": false
+    },
+    {
+      "code": "BATTERY",
+      "title": "Правильность подбора аккумуляторов",
+      "group": "питание",
+      "requires": ["battery_or_calc"],
+      "ai": false
+    },
+    {
+      "code": "ATTACHED_CALCS",
+      "title": "Проверка всех прилагаемых расчётов",
+      "group": "расчёты",
+      "requires": ["calculation"],
+      "ai": true
+    },
+    {
+      "code": "ELEC_SCHEME",
+      "title": "Корректность электрических схем",
+      "group": "схемы",
+      "requires": ["scheme_electrical"],
+      "ai": true
+    },
+    {
+      "code": "STRUCT_SCHEME",
+      "title": "Корректность структурных схем",
+      "group": "схемы",
+      "requires": ["scheme_structural"],
+      "ai": true
+    },
+    {
+      "code": "CONNECTIONS",
+      "title": "Правильность электрических подключений",
+      "group": "схемы",
+      "requires": ["scheme_or_connections"],
+      "ai": true
+    },
+    {
+      "code": "SPZ_POWER_CATEGORY",
+      "title": "Категория электроснабжения электроприёмников СПЗ",
+      "group": "пожарная безопасность",
+      "requires": ["scheme_or_calc"],
+      "systems": ["PS", "SOUE", "PT"],
+      "ai": false
+    }
+  ]
+}

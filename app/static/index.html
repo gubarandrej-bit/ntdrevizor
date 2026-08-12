@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ревизор НТД</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect rx='12' width='64' height='64' fill='%23101822'/%3E%3Cpath d='M14 34l10 10 26-26' stroke='%23d4a054' stroke-width='6' fill='none' stroke-linecap='round'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body>
+  <div id="app">
+    <section id="view-login" class="login-wrap">
+      <div class="login-card">
+        <div class="brand">
+          <div class="mark">Р</div>
+          <div>
+            <div class="brand-name">Ревизор НТД</div>
+            <div class="brand-sub">Проверка рабочей документации инженерных сетей</div>
+          </div>
+        </div>
+        <form id="login-form">
+          <label>Логин<input id="login-user" autocomplete="username" required /></label>
+          <label>Пароль<input id="login-pass" type="password" autocomplete="current-password" required /></label>
+          <button type="submit" class="btn primary wide">Войти</button>
+          <p id="login-error" class="error" hidden></p>
+        </form>
+        <p class="hint">Локальный / облачный / гибридный режимы · ПУЭ · СП · ГОСТ · ФЗ</p>
+      </div>
+    </section>
+
+    <section id="view-app" hidden>
+      <aside class="sidebar">
+        <div class="brand compact">
+          <div class="mark">Р</div>
+          <div>
+            <div class="brand-name">Ревизор НТД</div>
+            <div class="brand-sub" id="whoami"></div>
+          </div>
+        </div>
+        <nav>
+          <button data-nav="dash" class="active">Сводка</button>
+          <button data-nav="new">Новая проверка</button>
+          <button data-nav="history">Архив проверок</button>
+          <button data-nav="ntd">База НТД</button>
+          <button data-nav="users" id="nav-users" hidden>Пользователи</button>
+          <button data-nav="settings">Настройки</button>
+        </nav>
+        <div class="sidebar-foot">
+          <button id="btn-logout" class="btn ghost">Выход</button>
+        </div>
+      </aside>
+
+      <main class="content">
+        <section data-page="dash" class="page">
+          <header class="page-h">
+            <h1>Сводка</h1>
+            <button class="btn primary" data-go="new">Новая проверка</button>
+          </header>
+          <div class="cards" id="dash-cards"></div>
+          <h2>Последние проверки</h2>
+          <div id="dash-list" class="table-wrap"></div>
+        </section>
+
+        <section data-page="new" class="page" hidden>
+          <header class="page-h"><h1>Новая проверка</h1></header>
+          <div class="grid-2">
+            <div class="panel">
+              <label>Наименование проверки<input id="new-title" placeholder="ЖК Север, раздел ЭОМ / АПС" /></label>
+              <label>Объект<input id="new-object" placeholder="Адрес или шифр объекта" /></label>
+              <div class="label">Инженерные системы</div>
+              <div id="sys-box" class="chips"></div>
+              <div class="label">Режим работы</div>
+              <div class="seg" id="mode-box">
+                <button data-mode="local">Локальный</button>
+                <button data-mode="cloud">Облачный</button>
+                <button data-mode="hybrid" class="on">Гибридный</button>
+              </div>
+              <div class="label">Модели ИИ <span class="muted">(только доступные в выбранном режиме)</span></div>
+              <div id="models-box" class="models"></div>
+              <button id="btn-create" class="btn primary">Создать карточку и перейти к загрузке</button>
+            </div>
+            <div class="panel hint-panel">
+              <h3>Правила проверки</h3>
+              <ol>
+                <li>Если исходных данных не хватает — система ничего не придумывает и запрашивает недостающее.</li>
+                <li>Непроведённые проверки перечисляются в диалоге с причиной.</li>
+                <li>Замечания ссылаются на пункты НТД и делятся на критические и некритические.</li>
+              </ol>
+              <p class="muted">Детерминированные сверки (журнал ↔ спецификация, сечения по ПУЭ) выполняются всегда, без ИИ. Модель нужна для разбора схем и текстовых расчётов.</p>
+            </div>
+          </div>
+        </section>
+
+        <section data-page="workspace" class="page" hidden>
+          <header class="page-h">
+            <div>
+              <h1 id="ws-title">Проверка</h1>
+              <p class="muted" id="ws-meta"></p>
+            </div>
+            <div class="row">
+              <button id="btn-start" class="btn primary">Запустить проверку</button>
+              <button id="btn-doc" class="btn">Отчёт DOC</button>
+              <button id="btn-xls" class="btn">Отчёт XLS</button>
+              <button id="btn-bov" class="btn">Ведомость XLS</button>
+            </div>
+          </header>
+          <div class="ws-grid">
+            <div class="panel">
+              <h3>Исходные файлы</h3>
+              <div class="drop" id="drop">
+                <input id="file-input" type="file" multiple hidden />
+                <p>Перетащите xls, doc, pdf, dwg / dxf или <a href="#" id="pick-files">выберите</a></p>
+                <select id="file-class">
+                  <option value="auto">Класс: определить автоматически</option>
+                  <option value="specification">Спецификация</option>
+                  <option value="cable_journal">Кабельный журнал</option>
+                  <option value="scheme_electrical">Электрическая схема</option>
+                  <option value="scheme_structural">Структурная схема</option>
+                  <option value="plan">План трасс</option>
+                  <option value="calculation">Расчёт</option>
+                  <option value="connections">Таблица подключений</option>
+                </select>
+              </div>
+              <div id="file-list"></div>
+            </div>
+            <div class="panel dialog-panel">
+              <h3>Диалоговое окно проверки</h3>
+              <div id="dialog" class="dialog"></div>
+              <form id="ask-form" class="ask">
+                <input id="ask-input" placeholder="Вопрос по результатам — без домыслов, только по фактам" />
+                <button class="btn primary" type="submit">Спросить</button>
+              </form>
+            </div>
+          </div>
+          <div class="grid-2">
+            <div class="panel">
+              <h3>Перечень проверок</h3>
+              <div id="check-list"></div>
+            </div>
+            <div class="panel">
+              <h3>Замечания</h3>
+              <div id="find-list"></div>
+            </div>
+          </div>
+        </section>
+
+        <section data-page="history" class="page" hidden>
+          <header class="page-h"><h1>Архив проверок</h1></header>
+          <div id="hist-list" class="table-wrap"></div>
+        </section>
+
+        <section data-page="ntd" class="page" hidden>
+          <header class="page-h">
+            <h1>База нормативно-технических документов</h1>
+            <div class="row">
+              <button id="btn-ntd-check" class="btn">Проверить актуальность</button>
+              <button id="btn-ntd-new" class="btn primary" hidden>Добавить</button>
+            </div>
+          </header>
+          <p class="muted" id="ntd-note"></p>
+          <div id="ntd-list" class="table-wrap"></div>
+        </section>
+
+        <section data-page="users" class="page" hidden>
+          <header class="page-h">
+            <h1>Пользователи</h1>
+            <button id="btn-user-new" class="btn primary">Добавить</button>
+          </header>
+          <div id="user-list" class="table-wrap"></div>
+        </section>
+
+        <section data-page="settings" class="page" hidden>
+          <header class="page-h"><h1>Настройки</h1></header>
+          <div class="panel narrow">
+            <label>Наименование организации<input id="set-company" /></label>
+            <label>Допуск расхождения количеств, %<input id="set-qty" type="number" step="0.1" /></label>
+            <label>Порог пояснения запаса длины план/журнал, %<input id="set-len" type="number" step="0.1" /></label>
+            <label>Сменить свой пароль<input id="set-pass" type="password" placeholder="не короче 8 символов" /></label>
+            <div class="row">
+              <button id="btn-save-set" class="btn primary">Сохранить</button>
+              <button id="btn-save-pass" class="btn">Сменить пароль</button>
+            </div>
+            <p class="muted">Ключи облачных моделей задаются в файле <code>.env</code> на сервере (см. INSTALL.md). В интерфейсе они не хранятся.</p>
+          </div>
+        </section>
+      </main>
+    </section>
+  </div>
+
+  <div id="modal" class="modal" hidden>
+    <div class="modal-card" id="modal-card"></div>
+  </div>
+  <div id="toast" class="toast" hidden></div>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
