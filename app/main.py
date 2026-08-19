@@ -58,7 +58,6 @@ def on_startup():
 
 
 if STATIC_DIR.exists():
-    app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets"), name="assets")
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
