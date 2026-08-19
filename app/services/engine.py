@@ -12,6 +12,7 @@ from app.config import ROOT_DIR, settings
 from app.models import Audit, AuditFile, CheckResult, DialogMessage, Finding, Setting
 from app.services import ai as ai_svc
 from app.services.checks import (
+    _is_cable_item,
     all_items,
     all_text,
     check_battery,
@@ -140,9 +141,28 @@ def _run(db: Session, audit: Audit, talk: Callable) -> None:
     # если спецификация не классифицировалась, но есть items — используем все items
     if not spec_items:
         spec_items = all_items(parsed, "items")
-    journal_items = all_items(journal_files, "cables") or all_items(journal_files, "items")
-    all_cables = journal_items + [i for i in spec_items if i]
     full_text = all_text(parsed)
+    journal_items = all_items(journal_files, "cables") or all_items(journal_files, "items")
+    # кабельный журнал может быть разделом внутри объединённого PDF/DOC
+    # (такой файл классифицируется как specification). Тогда берём строки с
+    # длиной/направлением из всех файлов как записи журнала.
+    if not journal_items:
+        low = full_text.lower()
+        if any(k in low for k in ("кабельный журнал", "направление кабеля", "потребность кабелей", "монтажная единица")):
+            # строки с длиной/направлением — это трассы кабельного журнала
+            journal_items = [
+                i
+                for i in all_items(parsed, "cables")
+                if i.get("length") is not None or i.get("from") or i.get("to")
+            ]
+            if not journal_items:
+                journal_items = [
+                    i
+                    for i in all_items(parsed, "items")
+                    if (i.get("length") is not None or i.get("from") or i.get("to"))
+                    and _is_cable_item(i)
+                ]
+    all_cables = journal_items + [i for i in spec_items if i]
     calc_text = all_text(calc_files) or full_text
 
     tol_qty = float(_setting(db, "qty_tolerance_pct", "5") or 5)

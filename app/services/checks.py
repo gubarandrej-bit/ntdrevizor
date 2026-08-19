@@ -199,7 +199,7 @@ def check_spec_journal_names(spec_items: list[dict], journal: list[dict]) -> dic
     if not journal:
         return _skip("Кабельный журнал не разобран или не загружен.")
 
-    spec_cables = [i for i in spec_items if _is_cable_item(i)]
+    spec_cables = [i for i in spec_items if _is_cable_item(i) and _is_material_line(i)]
     if not spec_cables:
         return {
             "status": "done",
@@ -268,7 +268,7 @@ def check_spec_journal_qty(spec_items: list[dict], journal: list[dict], tol_pct:
         return _skip("Спецификация не разобрана — количества сверить нельзя.")
     if not journal:
         return _skip("Кабельный журнал не разобран — количества сверить нельзя.")
-    spec_cables = [i for i in spec_items if _is_cable_item(i)]
+    spec_cables = [i for i in spec_items if _is_cable_item(i) and _is_material_line(i)]
     if not spec_cables:
         return _skip("В спецификации не выделены кабельные позиции с количеством/длиной.")
 
@@ -334,7 +334,25 @@ def check_spec_journal_qty(spec_items: list[dict], journal: list[dict], tol_pct:
 
 
 def _is_cable_item(i: dict) -> bool:
-    return looks_like_cable(" ".join(str(i.get(k) or "") for k in ("name", "mark", "type")))
+    return looks_like_cable(" ".join(str(i.get(k) or "") for k in ("name", "mark", "type", "manufacturer")))
+
+
+def _is_material_line(i: dict) -> bool:
+    """Строка спецификации — материальная позиция (есть количество/длина).
+
+    Отсекает строки оглавления и заголовков («План … кабельных трасс»),
+    которые содержат слово «кабель», но не являются позициями спецификации.
+    """
+    return i.get("qty") is not None or i.get("length") is not None
+
+
+def _cable_brand(i: dict) -> str:
+    """Марка кабеля: предпочитаем заводскую марку, если она выглядит как кабель."""
+    for k in ("manufacturer", "mark", "type", "name"):
+        v = str(i.get(k) or "").strip()
+        if v and looks_like_cable(v):
+            return v
+    return str(i.get("mark") or i.get("name") or "").strip()
 
 
 def _strip_section_from_mark(mark: str) -> str:
@@ -346,10 +364,11 @@ def _strip_section_from_mark(mark: str) -> str:
 
 
 def _cable_key(i: dict) -> str:
-    mark = _strip_section_from_mark(i.get("mark") or i.get("type") or "")
-    name = _strip_section_from_mark(i.get("name") or "")
+    brand = _cable_brand(i)
+    mark = _strip_section_from_mark(brand) if brand else ""
+    name = _strip_section_from_mark(i.get("name") or "") if not brand else ""
     parsed = i.get("section") or parse_section(
-        " ".join(str(i.get(k) or "") for k in ("mark", "name", "type"))
+        " ".join(str(i.get(k) or "") for k in ("mark", "manufacturer", "name", "type"))
     )
     sec = ""
     if parsed and parsed.get("mm2"):

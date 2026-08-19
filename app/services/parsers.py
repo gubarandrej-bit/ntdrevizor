@@ -113,12 +113,7 @@ def parse_spreadsheet(path: Path) -> dict[str, Any]:
                 if not item:
                     continue
                 items.append(item)
-                if looks_like_cable(
-                    " ".join(
-                        str(item.get(k, ""))
-                        for k in ("name", "mark", "type", "note")
-                    )
-                ) or rec.get("from") or rec.get("to") or rec.get("length"):
+                if looks_like_cable(_cable_blob(item)) or rec.get("from") or rec.get("to") or rec.get("length"):
                     cables.append(item)
     finally:
         wb.close()
@@ -130,7 +125,7 @@ def parse_spreadsheet(path: Path) -> dict[str, Any]:
         tables=tables,
         items=items,
         cables=cables,
-        equipment=[i for i in items if not looks_like_cable(i.get("name", "") + " " + i.get("mark", ""))],
+        equipment=[i for i in items if not looks_like_cable(_cable_blob(i))],
     )
 
 
@@ -193,7 +188,7 @@ def parse_document(path: Path) -> dict[str, Any]:
             item = _record_to_item(rec, f"таблица {ti + 1}")
             if item:
                 items.append(item)
-                if looks_like_cable(item.get("name", "") + " " + item.get("mark", "")):
+                if looks_like_cable(_cable_blob(item)):
                     cables.append(item)
         tables.append({"sheet": f"table_{ti + 1}", "headers": headers, "mapped": mapped, "records": records})
 
@@ -204,7 +199,7 @@ def parse_document(path: Path) -> dict[str, Any]:
         tables=tables,
         items=items,
         cables=cables,
-        equipment=[i for i in items if not looks_like_cable(i.get("name", "") + i.get("mark", ""))],
+        equipment=[i for i in items if not looks_like_cable(_cable_blob(i))],
     )
 
 
@@ -259,6 +254,7 @@ def parse_pdf(path: Path) -> dict[str, Any]:
     text_parts: list[str] = []
     tables: list[dict[str, Any]] = []
     notes = []
+    slow_pages: set[int] = set()  # страницы, «зависшие» на извлечении текста
 
     # 1) Текст — сначала через pypdf, с тайм-аутом на страницу: некоторые
     #    страницы с плотной векторной графикой разбираются секунды и десятки
@@ -273,6 +269,7 @@ def parse_pdf(path: Path) -> dict[str, Any]:
             t = _extract_text_bounded(page, text_timeout)
             if t is None:
                 skipped_text += 1
+                slow_pages.add(i + 1)  # 1-based; эти страницы не даём и на разбор таблиц
                 continue
             if t.strip():
                 text_parts.append(f"--- страница {i + 1} ---\n{t}")
@@ -317,14 +314,29 @@ def parse_pdf(path: Path) -> dict[str, Any]:
 
             def _priority(pn: int) -> int:
                 low = page_texts.get(pn, "").lower()
-                if any(h in low for h in ("наименование", "поз.")):
-                    return 0  # спецификация / журнал / ведомость — быстрые
-                if any(h in low for h in ("кол.", "ед.", "примечание", "обозначение")):
+                # явные маркеры спецификации (ГОСТ 21.110) и кабельного журнала —
+                # самые важные и быстрые страницы
+                if any(
+                    k in low
+                    for k in (
+                        "спецификация оборудован",
+                        "спецификация издели",
+                        "кабельный журнал",
+                        "направление кабеля",
+                        "потребность кабелей",
+                    )
+                ):
+                    return 0
+                if "поз." in low and "наименование" in low:
+                    return 0
+                if "наименование" in low and "кол." in low:
                     return 1
-                return 2  # планы/схемы — пропускаем, если нет бюджета
+                if any(k in low for k in ("наименование", "обозначение", "примечание", "марка", "длина")):
+                    return 2
+                return 3  # планы/чертежи, где «кол.» — из штампа: пропускаем
 
             candidates = sorted(
-                [pn for pn in page_texts if _priority(pn) < 2],
+                [pn for pn in page_texts if _priority(pn) <= 2 and pn not in slow_pages],
                 key=lambda pn: (_priority(pn), pn),
             )
 
@@ -384,7 +396,7 @@ def parse_pdf(path: Path) -> dict[str, Any]:
             item = _record_to_item(rec, table.get("sheet", ""))
             if item:
                 items.append(item)
-                if looks_like_cable(item.get("name", "") + " " + item.get("mark", "")):
+                if looks_like_cable(_cable_blob(item)):
                     cables.append(item)
 
     return _base(
@@ -670,12 +682,12 @@ HEADER_ALIASES: dict[str, tuple[str, ...]] = {
     "unit": ("ед", "единиц", "изм", "unit"),
     "qty": ("кол", "колич", "qty", "количество", "число"),
     "length": ("длин", "l,", "трасс", "метр"),
-    "from": ("откуда", "начало", "от куда", "из", "start", "питающ"),
-    "to": ("куда", "конец", "к ", "finish", "потребит", "назначен"),
+    "from": ("откуда", "начало", "от куда", "start", "питающ"),
+    "to": ("куда", "конец", "finish", "потребит", "назначен", "направлен"),
     "laying": ("способ", "проклад", "уклад", "лоток", "труба", "транше"),
     "power": ("мощн", "p,", "квт", "вт", "kw"),
     "current": ("ток", "iном", "а,", "current"),
-    "voltage": ("напр", "uном", "вольт", "voltage"),
+    "voltage": ("напряж", "uном", "u,", "вольт", "voltage"),
     "cos": ("cos", "коэфф мощности", "cosφ", "cosf"),
     "note": ("примеч", "примечание", "note"),
     "manufacturer": ("завод", "изготов", "произв"),
@@ -706,6 +718,14 @@ def _map_headers(headers: list[Any]) -> dict[str, int]:
     return mapped
 
 
+def _cable_blob(item: dict[str, Any]) -> str:
+    """Текст для определения «это кабель?» по всем значимым полям."""
+    return " ".join(
+        str(item.get(k) or "")
+        for k in ("name", "mark", "type", "manufacturer", "note")
+    )
+
+
 def _record_to_item(rec: dict[str, Any], sheet: str) -> dict[str, Any] | None:
     name = str(rec.get("name") or "").strip()
     mark = str(rec.get("mark") or rec.get("type") or "").strip()
@@ -733,6 +753,7 @@ def _record_to_item(rec: dict[str, Any], sheet: str) -> dict[str, Any] | None:
         "voltage": parse_float(rec.get("voltage")),
         "cos": parse_float(rec.get("cos")),
         "note": str(rec.get("note") or "").strip(),
+        "manufacturer": str(rec.get("manufacturer") or "").strip(),
         "sheet": sheet,
     }
     if item["length"] is None and item["unit"] in {"м", "м.", "м.п", "м.п.", "п.м", "пм"} and item["qty"]:
