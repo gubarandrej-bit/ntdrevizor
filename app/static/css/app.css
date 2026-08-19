@@ -19,6 +19,7 @@
   --sans: "Segoe UI", "IBM Plex Sans", "Manrope", system-ui, sans-serif;
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: var(--sans); }
 body {
   background:
