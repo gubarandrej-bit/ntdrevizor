@@ -94,6 +94,26 @@ REQUIRED_BY_SYSTEM = {
 }
 
 
+# Класс документа может быть не отдельным файлом, а разделом внутри объединённого
+# PDF/DOC. Тогда класс «засчитываем» по явным фразам в тексте файлов.
+_TEXT_CLASS_EVIDENCE: dict[str, tuple[str, ...]] = {
+    "specification": ("спецификация оборудован", "спецификация издели"),
+    "scheme_electrical": ("схема электрич", "однолинейн", "принципиальн"),
+    "scheme_structural": ("схема структурн", "структурная схема", "функциональная схема"),
+    "cable_journal": ("кабельный журнал", "журнал кабел"),
+    "plan": ("план расположен", "план прокладк", "план трасс"),
+    "calculation": ("расчетн", "расчётн"),
+}
+
+
+def _files_text_match(files: list[dict[str, Any]], *phrases: str) -> bool:
+    """Есть ли хотя бы одна из фраз в тексте загруженных файлов."""
+    hay = " ".join(((f.get("extracted") or {}).get("text") or "").lower() for f in files)
+    if not hay.strip():
+        return False
+    return any(p in hay for p in phrases)
+
+
 def check_completeness(files: list[dict[str, Any]], systems: list[str]) -> dict[str, Any]:
     present = {f.get("classified_as") for f in files}
     names = [f.get("filename") for f in files]
@@ -109,12 +129,20 @@ def check_completeness(files: list[dict[str, Any]], systems: list[str]) -> dict[
         )
         return {"status": "done", "reason": "", "findings": findings}
 
+    # учитываем разделы внутри объединённых PDF/DOC как наличие класса
+    effective = set(present)
+    for cls, phrases in _TEXT_CLASS_EVIDENCE.items():
+        if cls not in effective and _files_text_match(files, *phrases):
+            effective.add(cls)
+
+    has_spec = "specification" in effective
+
     missing_global = []
-    if "specification" not in present:
+    if not has_spec:
         missing_global.append("спецификация оборудования, изделий и материалов")
     for sys in systems:
         need = REQUIRED_BY_SYSTEM.get(sys, ["specification"])
-        absent = [x for x in need if x not in present and not _has_alt(x, present)]
+        absent = [x for x in need if x not in effective and not _has_alt(x, effective)]
         if absent:
             findings.append(
                 finding(
@@ -129,7 +157,7 @@ def check_completeness(files: list[dict[str, Any]], systems: list[str]) -> dict[
                     evidence="Загружено: " + ", ".join(names),
                 )
             )
-    if "specification" not in present:
+    if not has_spec:
         findings.append(
             finding(
                 "critical",

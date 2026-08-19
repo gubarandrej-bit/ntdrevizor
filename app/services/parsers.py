@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -205,26 +208,137 @@ def parse_document(path: Path) -> dict[str, Any]:
     )
 
 
+def _extract_text_bounded(page: Any, timeout: float) -> str | None:
+    """extract_text() с тайм-аутом. Возвращает None, если страница «зависла».
+
+    Некоторые страницы с плотной векторной графикой разбираются секунды
+    и десятки секунд; их текст пропускаем, чтобы не блокировать проверку.
+    """
+    box: dict[str, Any] = {"done": False, "text": ""}
+
+    def _job() -> None:
+        try:
+            box["text"] = page.extract_text() or ""
+        except Exception:
+            box["text"] = ""
+        finally:
+            box["done"] = True
+
+    t = threading.Thread(target=_job, daemon=True)
+    t.start()
+    t.join(timeout)
+    return box["text"] if box["done"] else None
+
+
+def _extract_tables_bounded(page: Any, timeout: float) -> list:
+    """extract_tables() с жёстким тайм-аутом.
+
+    pdfplumber умеет «зависать» на сложных страницах на десятки секунд.
+    Возвращаем [] если не уложились; поток-демон дорабатывает в фоне и не
+    блокирует ни сервер, ни последующие страницы.
+    """
+    box: dict[str, Any] = {"done": False, "tables": []}
+
+    def _job() -> None:
+        try:
+            box["tables"] = page.extract_tables() or []
+        except Exception:
+            box["tables"] = []
+        finally:
+            box["done"] = True
+
+    t = threading.Thread(target=_job, daemon=True)
+    t.start()
+    t.join(timeout)
+    return list(box["tables"]) if box["done"] else []
+
+
 def parse_pdf(path: Path) -> dict[str, Any]:
+    from app.config import settings
+
     text_parts: list[str] = []
     tables: list[dict[str, Any]] = []
     notes = []
-    try:
-        import pdfplumber
-    except ImportError:
-        pdfplumber = None  # type: ignore
 
-    if pdfplumber is not None:
+    # 1) Текст — сначала через pypdf, с тайм-аутом на страницу: некоторые
+    #    страницы с плотной векторной графикой разбираются секунды и десятки
+    #    секунд (именно они «вешали» парсер), их пропускаем.
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(path))
+        text_timeout = float(getattr(settings, "pdf_text_page_timeout", 2.5) or 2.5)
+        skipped_text = 0
+        for i, page in enumerate(reader.pages[:80]):
+            t = _extract_text_bounded(page, text_timeout)
+            if t is None:
+                skipped_text += 1
+                continue
+            if t.strip():
+                text_parts.append(f"--- страница {i + 1} ---\n{t}")
+        if skipped_text:
+            notes.append(f"Текст {skipped_text} стр. пропущен (сложная векторная графика).")
+    except Exception as exc:
+        notes.append(f"pypdf: {exc}")
+
+    if not text_parts:
+        # pypdf не вытащил текст — пробуем pdfplumber (обычно работает, если текст есть)
         try:
+            import pdfplumber
+
             with pdfplumber.open(str(path)) as pdf:
                 for i, page in enumerate(pdf.pages[:80]):
-                    t = page.extract_text() or ""
-                    if t.strip():
-                        text_parts.append(f"--- страница {i + 1} ---\n{t}")
-                    try:
-                        extracted = page.extract_tables() or []
-                    except Exception:
-                        extracted = []
+                    t = _extract_text_bounded(page, 3.0)
+                    if t is None or not t.strip():
+                        continue
+                    text_parts.append(f"--- страница {i + 1} ---\n{t}")
+        except Exception as exc:
+            notes.append(f"pdfplumber: {exc}")
+
+    text = "\n".join(text_parts).strip()
+
+    # 2) Таблицы — best-effort с жёсткими лимитами времени.
+    #    Сначала обрабатываем страницы с явными табличными признаками
+    #    (спецификация, кабельный журнал) — они быстрые; планы и схемы,
+    #    где pdfplumber может «зависнуть», идут вторыми, если останется бюджет.
+    if len(text) >= 40:
+        try:
+            import pdfplumber
+
+            budget = float(getattr(settings, "pdf_table_budget", 15.0) or 15.0)
+            page_timeout = float(getattr(settings, "pdf_table_page_timeout", 6.0) or 6.0)
+
+            # собираем текст по страницам
+            page_texts: dict[int, str] = {}
+            for tp in text_parts:
+                m = re.match(r"--- страница (\d+) ---\n?", tp)
+                if m:
+                    page_texts[int(m.group(1))] = tp
+
+            def _priority(pn: int) -> int:
+                low = page_texts.get(pn, "").lower()
+                if any(h in low for h in ("наименование", "поз.")):
+                    return 0  # спецификация / журнал / ведомость — быстрые
+                if any(h in low for h in ("кол.", "ед.", "примечание", "обозначение")):
+                    return 1
+                return 2  # планы/схемы — пропускаем, если нет бюджета
+
+            candidates = sorted(
+                [pn for pn in page_texts if _priority(pn) < 2],
+                key=lambda pn: (_priority(pn), pn),
+            )
+
+            deadline = time.monotonic() + budget
+            with pdfplumber.open(str(path)) as pdf:
+                for pn in candidates:
+                    if pn > len(pdf.pages):
+                        continue
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        notes.append("Лимит времени на разбор таблиц PDF исчерпан — часть таблиц пропущена.")
+                        break
+                    page = pdf.pages[pn - 1]
+                    extracted = _extract_tables_bounded(page, min(page_timeout, remaining))
                     for ti, table in enumerate(extracted):
                         if not table:
                             continue
@@ -240,28 +354,15 @@ def parse_pdf(path: Path) -> dict[str, Any]:
                             records.append(rec)
                         tables.append(
                             {
-                                "sheet": f"p{i + 1}_t{ti + 1}",
+                                "sheet": f"p{pn}_t{ti + 1}",
                                 "headers": headers,
                                 "mapped": mapped,
                                 "records": records,
                             }
                         )
         except Exception as exc:
-            notes.append(f"pdfplumber: {exc}")
+            notes.append(f"pdfplumber-tables: {exc}")
 
-    if not text_parts:
-        try:
-            from pypdf import PdfReader
-
-            reader = PdfReader(str(path))
-            for i, page in enumerate(reader.pages[:80]):
-                t = page.extract_text() or ""
-                if t.strip():
-                    text_parts.append(f"--- страница {i + 1} ---\n{t}")
-        except Exception as exc:
-            notes.append(f"pypdf: {exc}")
-
-    text = "\n".join(text_parts).strip()
     if len(text) < 40:
         ocr_text, ocr_note = _ocr_pdf(path)
         notes.append(ocr_note)

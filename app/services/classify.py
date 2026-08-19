@@ -90,6 +90,13 @@ def classify_file(filename: str, text_sample: str = "", user_class: str = "") ->
     if user_class and user_class != "auto":
         return user_class
     blob = norm(filename + " " + (text_sample or "")[:4000])
+    big = norm(text_sample or "")
+    # Объединённый комплект РД (один PDF/DOC со всеми разделами): явный заголовок
+    # «Спецификация оборудования, изделий и материалов» (ГОСТ 21.110) — сильный
+    # признак того, что внутри есть спецификация. Без этого такие файлы часто
+    # ошибочно классифицируются как «расчёт» по общим словам «нагрузка/ток».
+    if "спецификация оборудован" in big or "спецификация издели" in big:
+        return "specification"
     scores: dict[str, int] = {}
     for cls, keys in CLASS_KEYWORDS:
         scores[cls] = sum(1 for k in keys if k in blob)
