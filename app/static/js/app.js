@@ -215,6 +215,7 @@ function renderModels() {
       }
       const lab = document.createElement("label");
       if (!m.ready) lab.classList.add("off");
+      if (!m.ready) lab.title = "Модель не готова. " + (m.note || "");
       lab.innerHTML = `<input type="checkbox" value="${esc(m.id)}" ${m.ready ? "" : "disabled"} />
         <span>${esc(m.name)}<small>${esc(m.note)}</small></span>`;
       box.appendChild(lab);
