@@ -96,8 +96,15 @@ sudo systemctl restart ntdrevizor
 sudo bash /opt/ntdrevizor/scripts/install-local-llm.sh
 ```
 
-Скрипт собирает `llama-cpp-python` **без AVX2** и пытается скачать Qwen2.5-1.5B Q4 (~1 ГиБ).  
+Скрипт сам установит `build-essential`, `cmake`, `ninja-build` (apt), обновит pip и соберёт `llama-cpp-python` **без AVX2**, затем скачает Qwen2.5-1.5B Q4 (~1 ГиБ).  
 На FX-8120 — примерно 2–5 токенов/с. Для разбора больших схем используйте облако.
+
+Если при сборке видите `Failed building wheel for cmake` / `Failed to build 'ninja'` — это значит, что pip пытается компилировать сборочные инструменты из исходников. Убедитесь, что скрипт выполнялся под root с доступом к сети (для `apt-get`), либо вручную:
+
+```bash
+sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build
+sudo /opt/ntdrevizor/.venv/bin/pip install --upgrade pip setuptools wheel
+```
 
 Либо установите [Ollama](https://ollama.com) на хост/ВМ:
 
