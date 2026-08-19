@@ -6,6 +6,8 @@ venv/
 .env
 data/app.db
 data/app.db-journal
+data/app.db-shm
+data/app.db-wal
 data/secret.key
 data/uploads/
 data/reports/
