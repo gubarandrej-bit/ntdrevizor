@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -36,6 +38,91 @@ def _quiet_pypdf() -> None:
         logging.getLogger("pypdf").setLevel(logging.ERROR)
     except Exception:
         pass
+
+
+# Воркер для извлечения текста PDF в отдельном процессе. Некоторые страницы
+# (планы с тысячами векторных объектов) разбираются pypdf десятки секунд;
+# в потоке их невозможно прервать (daemon-потоки продолжают работать и давят
+# на GIL, выжигая бюджет разбора таблиц). Отдельный процесс можно убить целиком.
+_PYPDF_TEXT_WORKER = r"""
+import json, sys, threading
+from pypdf import PdfReader
+
+def main():
+    path, out, page_timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])
+    reader = PdfReader(path)
+    f = open(out, "w", encoding="utf-8")
+    for i, page in enumerate(reader.pages[:80]):
+        box = {"done": False, "text": ""}
+        def job():
+            try:
+                box["text"] = page.extract_text() or ""
+            except Exception:
+                box["text"] = ""
+            finally:
+                box["done"] = True
+        t = threading.Thread(target=job, daemon=True)
+        t.start()
+        t.join(page_timeout)
+        if box["done"]:
+            if box["text"].strip():
+                f.write(json.dumps([i + 1, box["text"]]) + "\n")
+                f.flush()
+        # «медленные» страницы не записываем — процесс всё равно убьют по бюджету
+    f.close()
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def _extract_pdf_text_subprocess(path: Path, budget: float, page_timeout: float) -> tuple[list[str], list[str]]:
+    """Извлекает текст страниц PDF в отдельном процессе с жёстким бюджетом.
+
+    Возвращает (text_parts, notes), где text_parts — строки «--- страница N ---».
+    Процесс принудительно убивается по бюджету; утечки потоков внутри процесса
+    не влияют на основной процесс и последующий разбор таблиц.
+    """
+    import os
+
+    tmp = Path(tempfile.mkdtemp(prefix="pdftext_"))
+    worker = tmp / "worker.py"
+    out = tmp / "out.jsonl"
+    notes: list[str] = []
+    try:
+        worker.write_text(_PYPDF_TEXT_WORKER, encoding="utf-8")
+        proc = subprocess.Popen(
+            [str(sys.executable), str(worker), str(path), str(out), f"{page_timeout}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            proc.wait(timeout=budget)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            notes.append(f"Бюджет {budget:g}с на текст PDF исчерпан — часть страниц пропущена.")
+        parts: list[str] = []
+        if out.exists():
+            for line in out.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    pn, text = json.loads(line)
+                    if str(text).strip():
+                        parts.append(f"--- страница {pn} ---\n{text}")
+                except Exception:
+                    continue
+        return parts, notes
+    except Exception as exc:
+        notes.append(f"pdf-text-subprocess: {exc}")
+        return [], notes
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def parse_file(path: Path) -> dict[str, Any]:
@@ -378,35 +465,22 @@ def parse_pdf(path: Path) -> dict[str, Any]:
 
     _quiet_pypdf()
 
+    # 1) Текст — в отдельном процессе с жёстким бюджетом. Некоторые страницы
+    #    (планы с плотной векторной графикой) разбираются pypdf десятки секунд;
+    #    в потоке их не прервать, а утечки потоков выжигают бюджет разбора
+    #    таблиц (спецификация/журнал оставались без таблиц). Процесс убивается
+    #    целиком, поэтому таблицы спецификации разбираются стабильно.
     text_parts: list[str] = []
     tables: list[dict[str, Any]] = []
     notes = []
-    slow_pages: set[int] = set()  # страницы, «зависшие» на извлечении текста
-
-    # 1) Текст — сначала через pypdf, с тайм-аутом на страницу: некоторые
-    #    страницы с плотной векторной графикой разбираются секунды и десятки
-    #    секунд (именно они «вешали» парсер), их пропускаем.
-    try:
-        from pypdf import PdfReader
-
-        reader = PdfReader(str(path))
-        text_timeout = float(getattr(settings, "pdf_text_page_timeout", 2.5) or 2.5)
-        skipped_text = 0
-        for i, page in enumerate(reader.pages[:80]):
-            t = _extract_text_bounded(page, text_timeout)
-            if t is None:
-                skipped_text += 1
-                slow_pages.add(i + 1)  # 1-based; эти страницы не даём и на разбор таблиц
-                continue
-            if t.strip():
-                text_parts.append(f"--- страница {i + 1} ---\n{t}")
-        if skipped_text:
-            notes.append(f"Текст {skipped_text} стр. пропущен (сложная векторная графика).")
-    except Exception as exc:
-        notes.append(f"pypdf: {exc}")
+    slow_pages: set[int] = set()
+    text_budget = float(getattr(settings, "pdf_text_budget", 60.0) or 60.0)
+    text_page_timeout = float(getattr(settings, "pdf_text_page_timeout", 2.5) or 2.5)
+    text_parts, t_notes = _extract_pdf_text_subprocess(path, text_budget, text_page_timeout)
+    notes.extend(t_notes)
 
     if not text_parts:
-        # pypdf не вытащил текст — пробуем pdfplumber (обычно работает, если текст есть)
+        # запасной вариант: pdfplumber в потоке (если подпроцесс недоступен)
         try:
             import pdfplumber
 
@@ -414,10 +488,30 @@ def parse_pdf(path: Path) -> dict[str, Any]:
                 for i, page in enumerate(pdf.pages[:80]):
                     t = _extract_text_bounded(page, 3.0)
                     if t is None or not t.strip():
+                        slow_pages.add(i + 1)
                         continue
                     text_parts.append(f"--- страница {i + 1} ---\n{t}")
         except Exception as exc:
             notes.append(f"pdfplumber: {exc}")
+
+    # страницы, не попавшие в текст (медленные/векторные), помечаем —
+    # их не даём и на разбор таблиц/геометрии
+    have_text = set()
+    for tp in text_parts:
+        m = re.match(r"--- страница (\d+) ---\n?", tp)
+        if m:
+            have_text.add(int(m.group(1)))
+    try:
+        from pypdf import PdfReader
+
+        total_pages = len(PdfReader(str(path)).pages)
+    except Exception:
+        total_pages = 80
+    for pn in range(1, min(total_pages, 80) + 1):
+        if pn not in have_text:
+            slow_pages.add(pn)
+    if slow_pages and not any("пропущен" in n for n in notes):
+        notes.append(f"Текст {len(slow_pages)} стр. пропущен (сложная векторная графика).")
 
     text = "\n".join(text_parts).strip()
 

@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     # «виснуть» на десятки секунд. Лимиты ниже это пресекают.
     pdf_table_budget: float = 15.0        # общий бюджет на разбор таблиц, с
     pdf_table_page_timeout: float = 6.0   # тайм-аут таблиц на одну страницу, с
+    pdf_text_budget: float = 60.0         # общий бюджет на извлечение текста PDF, с
     pdf_text_page_timeout: float = 2.5    # тайм-аут текста на одну страницу, с
 
     jwt_expire_hours: int = 12
