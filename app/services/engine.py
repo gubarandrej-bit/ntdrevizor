@@ -532,8 +532,8 @@ def _slice_pages(extracted: dict, markers: tuple[str, ...]) -> dict:
     data["items"] = []
     data["cables"] = []
     data["equipment"] = []
-    data["lengths"] = []
     data["texts_geom"] = []
+    # lengths (геометрия планов) сохраняем — они уже отфильтрованы по страницам-планам
     return data
 
 

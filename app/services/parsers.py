@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import shutil
 import subprocess
@@ -225,6 +226,113 @@ def _extract_text_bounded(page: Any, timeout: float) -> str | None:
     return box["text"] if box["done"] else None
 
 
+_PLAN_PAGE_MARKERS = ("план расположен", "план прокладк", "план трасс")
+
+
+def _is_cable_color(c: Any) -> bool:
+    """Цветная линия (красная/синяя/зелёная и т.п.) — признак трассы на CAD-плане.
+
+    Стены, оси, размеры и штриховки обычно чёрные/серые; кабельные трассы на
+    планах СКУД/ЭОМ рисуют цветом. Возвращает False для серых/чёрных/белых.
+    """
+    if not c:
+        return False
+    try:
+        r, g, b = c
+    except Exception:
+        return False
+    mx, mn = max(c), min(c)
+    if mx - mn < 0.15:  # серый/чёрный/белый
+        return False
+    if mx < 0.3:  # слишком тёмный — почти чёрный
+        return False
+    return True
+
+
+def _color_label(c: Any) -> str:
+    if not c:
+        return "none"
+    try:
+        return "rgb(%d,%d,%d)" % tuple(int(round(x * 255)) for x in c)
+    except Exception:
+        return "none"
+
+
+def _extract_geometry_bounded(page: Any, timeout: float):
+    """(lines, curves) страницы с тайм-аутом; None — если страница «зависла»."""
+    box: dict[str, Any] = {"done": False, "lines": [], "curves": []}
+
+    def _job() -> None:
+        try:
+            box["lines"] = page.lines or []
+            box["curves"] = page.curves or []
+        except Exception:
+            box["lines"], box["curves"] = [], []
+        finally:
+            box["done"] = True
+
+    t = threading.Thread(target=_job, daemon=True)
+    t.start()
+    t.join(timeout)
+    return (box["lines"], box["curves"]) if box["done"] else None
+
+
+def _extract_plan_lengths(
+    pdf: Any,
+    page_texts: dict[int, str],
+    slow_pages: set[int],
+    timeout: float,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Измеряет линии/кривые на страницах-планах PDF.
+
+    Кабельные трассы выделяются по цвету (likely_cable=True). Длина — в единицах
+    чертежа (pt); масштаб листа в PDF не хранится, поэтому перевод в метры
+    выполняется только при явной надписи масштаба (см. check_plan_lengths).
+    """
+    lengths: list[dict[str, Any]] = []
+    notes: list[str] = []
+    for pn, ptext in page_texts.items():
+        if pn in slow_pages:
+            continue
+        if not any(m in ptext.lower() for m in _PLAN_PAGE_MARKERS):
+            continue
+        if pn > len(pdf.pages):
+            continue
+        geo = _extract_geometry_bounded(pdf.pages[pn - 1], timeout)
+        if geo is None:
+            notes.append(f"Геометрия стр. {pn} не извлечена (тайм-аут).")
+            continue
+        lines, curves = geo
+        for ln in lines:
+            L = math.hypot(ln["x1"] - ln["x0"], ln["top"] - ln["bottom"])
+            if L < 0.1:
+                continue
+            lengths.append(
+                {
+                    "layer": _color_label(ln.get("stroking_color")),
+                    "type": "LINE",
+                    "length": round(L, 3),
+                    "likely_cable": _is_cable_color(ln.get("stroking_color")),
+                }
+            )
+        for cu in curves:
+            pts = cu.get("pts") or []
+            L = 0.0
+            for a, b in zip(pts, pts[1:]):
+                L += math.hypot(b[0] - a[0], b[1] - a[1])
+            if L < 0.1:
+                continue
+            lengths.append(
+                {
+                    "layer": _color_label(cu.get("stroking_color")),
+                    "type": "CURVE",
+                    "length": round(L, 3),
+                    "likely_cable": _is_cable_color(cu.get("stroking_color")),
+                }
+            )
+    return lengths, notes
+
+
 def _extract_tables_bounded(page: Any, timeout: float) -> list:
     """extract_tables() с жёстким тайм-аутом.
 
@@ -294,6 +402,13 @@ def parse_pdf(path: Path) -> dict[str, Any]:
 
     text = "\n".join(text_parts).strip()
 
+    # текст по страницам (нужен и для таблиц, и для геометрии планов)
+    page_texts: dict[int, str] = {}
+    for tp in text_parts:
+        m = re.match(r"--- страница (\d+) ---\n?", tp)
+        if m:
+            page_texts[int(m.group(1))] = tp
+
     # 2) Таблицы — best-effort с жёсткими лимитами времени.
     #    Сначала обрабатываем страницы с явными табличными признаками
     #    (спецификация, кабельный журнал) — они быстрые; планы и схемы,
@@ -304,13 +419,6 @@ def parse_pdf(path: Path) -> dict[str, Any]:
 
             budget = float(getattr(settings, "pdf_table_budget", 15.0) or 15.0)
             page_timeout = float(getattr(settings, "pdf_table_page_timeout", 6.0) or 6.0)
-
-            # собираем текст по страницам
-            page_texts: dict[int, str] = {}
-            for tp in text_parts:
-                m = re.match(r"--- страница (\d+) ---\n?", tp)
-                if m:
-                    page_texts[int(m.group(1))] = tp
 
             def _priority(pn: int) -> int:
                 low = page_texts.get(pn, "").lower()
@@ -399,6 +507,19 @@ def parse_pdf(path: Path) -> dict[str, Any]:
                 if looks_like_cable(_cable_blob(item)):
                     cables.append(item)
 
+    # 3) Геометрия планов — измерение трасс (цветные линии/кривые).
+    lengths: list[dict[str, Any]] = []
+    if page_texts:
+        try:
+            import pdfplumber
+
+            geo_timeout = float(getattr(settings, "pdf_text_page_timeout", 2.5) or 2.5) * 4
+            with pdfplumber.open(str(path)) as pdf:
+                lengths, geo_notes = _extract_plan_lengths(pdf, page_texts, slow_pages, geo_timeout)
+                notes.extend(geo_notes)
+        except Exception as exc:
+            notes.append(f"pdf-geometry: {exc}")
+
     return _base(
         ok=True,
         kind="pdf",
@@ -406,6 +527,7 @@ def parse_pdf(path: Path) -> dict[str, Any]:
         tables=tables,
         items=items,
         cables=cables,
+        lengths=lengths,
         notes="; ".join(notes),
     )
 

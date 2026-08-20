@@ -476,15 +476,98 @@ def check_scheme_vs_spec(spec_items: list[dict], scheme_files: list[dict]) -> di
 
 # ---------- длины на планах ----------
 
+_SCALE_NOTE_RE = re.compile(r"\b(?:масштаб|м)\s*1\s*[:：]\s*(\d+)\b", re.I)
+
+
+def _journal_total(journal: list[dict]) -> tuple[float, int, int]:
+    """(сумма длин, строк с длиной, строк без длины) по журналу."""
+    total = 0.0
+    n = 0
+    missing = 0
+    for row in journal:
+        val = row.get("length") if row.get("length") is not None else row.get("qty")
+        if val is None:
+            missing += 1
+            continue
+        total += float(val)
+        n += 1
+    return total, n, missing
+
+
+def _check_pdf_plan_lengths(journal: list[dict], pdf_plans: list[dict]) -> dict[str, Any]:
+    """Измерение трасс на PDF-планах по цветным линиям (без выдумывания метров)."""
+    jour_total, jour_n, _ = _journal_total(journal)
+    if jour_n == 0:
+        return _skip("В журнале нет ни одной числовой длины.")
+
+    findings = []
+    for f in pdf_plans:
+        ext = f.get("extracted") or {}
+        lens = ext.get("lengths") or []
+        cable = [x for x in lens if x.get("likely_cable")]
+        if not cable:
+            findings.append(
+                finding(
+                    "info",
+                    "На плане не выделены цветные трассы",
+                    f"{f.get('filename')}: цветных линий (трасс) не найдено — измерение невозможно.",
+                    ["ГОСТ 21.613-2014"],
+                )
+            )
+            continue
+        measured = sum(float(x.get("length") or 0) for x in cable)
+        n_lines = len(cable)
+        m = _SCALE_NOTE_RE.search(ext.get("text") or "")
+        if m:
+            scale = int(m.group(1))
+            if scale > 0:
+                # 1 pt = 1/72 дюйма = 25.4/72 мм; при масштабе 1:N 1 м = (1000/N) мм = (1000/N)*72/25.4 pt
+                meters = measured * scale / 2834.6
+                diff_pct = (meters - jour_total) / jour_total * 100 if jour_total else 0.0
+                findings.append(
+                    finding(
+                        "noncritical" if abs(diff_pct) > 10 else "info",
+                        "Измерение трасс на PDF-плане (ориентировочно)",
+                        f"{f.get('filename')}: цветных линий трасс {n_lines} шт, сумма {measured:.0f} pt ≈ {meters:.1f} м (масштаб по надписи 1:{scale}). "
+                        f"Сумма длин журнала {jour_total:.1f} м — расхождение {diff_pct:+.1f}%. "
+                        f"Оценка по цвету линий без слоёв — требуется проверка по DXF/DWG.",
+                        ["ГОСТ 21.613-2014"],
+                        evidence=f"measured_pt={measured:.0f}; scale=1:{scale}",
+                    )
+                )
+                continue
+        findings.append(
+            finding(
+                "info",
+                "Измерение трасс на PDF-плане: масштаб не указан",
+                f"{f.get('filename')}: сумма цветных линий трасс {measured:.0f} ед. чертежа по {n_lines} линиям. "
+                f"Масштаб листа не указан — перевод в метры не выполняется, данные не выдумываются. "
+                f"Сумма журнала {jour_total:.1f} м. Для численного сравнения нужен DXF/DWG либо надпись масштаба на листе.",
+                ["ГОСТ 21.613-2014"],
+                evidence=f"measured_pt={measured:.0f}",
+            )
+        )
+    if not findings:
+        return _skip("Не удалось измерить трассы на PDF-планах.")
+    return {"status": "done", "reason": "", "findings": findings}
+
+
 def check_plan_lengths(journal: list[dict], plan_files: list[dict], tol_pct: float) -> dict[str, Any]:
     if not journal:
         return _skip("Кабельный журнал отсутствует — сравнивать длины трасс не с чем.")
     if not plan_files:
         return _skip("Планы трасс не загружены (нужен DXF/DWG или план с измеримыми линиями).")
 
+    pdf_plans = [f for f in plan_files if (f.get("extracted") or {}).get("kind") == "pdf"]
+    vector_plans = [f for f in plan_files if (f.get("extracted") or {}).get("kind") != "pdf"]
+
+    findings: list[dict[str, Any]] = []
+    if pdf_plans:
+        findings.extend((_check_pdf_plan_lengths(journal, pdf_plans)).get("findings", []))
+
     usable = []
     errors = []
-    for f in plan_files:
+    for f in vector_plans:
         ext = f.get("extracted") or {}
         if not ext.get("ok"):
             errors.append(f"{f.get('filename')}: {ext.get('error') or 'не разобран'}")
@@ -494,23 +577,16 @@ def check_plan_lengths(journal: list[dict], plan_files: list[dict], tol_pct: flo
             # если есть любые полилинии — берём, но пометим
             lens = ext.get("lengths") or []
             if not lens:
-                if ext.get("kind") == "pdf":
-                    errors.append(
-                        f"{f.get('filename')}: план в PDF — векторная графика без слоёв "
-                        f"кабельных трасс; длины не измеряются автоматически (нужен DXF/DWG)."
-                    )
-                else:
-                    errors.append(f"{f.get('filename')}: в чертеже нет измеримых линий/полилиний.")
+                errors.append(f"{f.get('filename')}: в чертеже нет измеримых линий/полилиний.")
                 continue
         usable.append((f, lens))
 
-    if not usable:
+    if not usable and not pdf_plans:
         return _skip(
             "Не удалось измерить трассы на планах. "
             + (" ".join(errors) if errors else "Нет DXF с линиями на кабельных слоях.")
         )
 
-    findings = []
     if errors:
         findings.append(
             finding(
@@ -529,23 +605,16 @@ def check_plan_lengths(journal: list[dict], plan_files: list[dict], tol_pct: flo
             if not x.get("likely_cable"):
                 cable_only = False
 
-    jour_total = 0.0
-    jour_n = 0
-    missing_len = 0
-    for row in journal:
-        val = row.get("length") if row.get("length") is not None else row.get("qty")
-        if val is None:
-            missing_len += 1
-            continue
-        jour_total += float(val)
-        jour_n += 1
+    jour_total, jour_n, missing_len = _journal_total(journal)
 
     if jour_n == 0:
-        return _skip("В журнале нет ни одной числовой длины.")
+        return {"status": "done", "reason": "", "findings": findings}
 
     # единицы DXF неизвестны — если числа отличаются на порядки, не делаем вывод
     ratio = (jour_total / plan_total) if plan_total else None
     if plan_total <= 0:
+        if findings:
+            return {"status": "done", "reason": "", "findings": findings}
         return _skip("Суммарная длина линий на плане равна нулю.")
 
     if ratio is not None and (ratio > 50 or ratio < 0.02):
