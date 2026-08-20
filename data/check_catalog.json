@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "updated": "2026-08-12",
+  "updated": "2026-08-20",
   "systems": [
     {"code": "ES", "name": "Электроснабжение"},
     {"code": "EO", "name": "Электроосвещение"},
@@ -41,6 +41,13 @@
     {
       "code": "SPEC_VS_JOURNAL_QTY",
       "title": "Кабельный журнал ↔ спецификация (количества и длины)",
+      "group": "сверки",
+      "requires": ["specification", "cable_journal"],
+      "ai": false
+    },
+    {
+      "code": "SPEC_VS_JOURNAL_SECTION",
+      "title": "Кабельный журнал ↔ спецификация (тип и сечение кабеля)",
       "group": "сверки",
       "requires": ["specification", "cable_journal"],
       "ai": false

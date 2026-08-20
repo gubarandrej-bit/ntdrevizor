@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import Audit, AuditFile, CheckResult, Finding, Setting
-from app.util import loads, looks_like_cable
+from app.util import loads, looks_like_cable, norm
 
 
 def build_reports(db: Session, audit: Audit) -> dict[str, str]:
@@ -272,14 +272,99 @@ def _write_xlsx(db: Session, audit: Audit, path: Path) -> None:
     wb.save(path)
 
 
+_HEIGHT_RE = re.compile(r"(?:отметк[а-я]*|отм\.?|высот[а-я]*)\s*[+-]?\s*(\d+(?:[.,]\d+)?)")
+
+HEIGHT_BAND_ORDER = [
+    "от 0 м до 5 м",
+    "от 5 м до 8 м",
+    "от 8 м до 12 м",
+    "более 12 м",
+    "высота не указана",
+]
+
+LAYING_ORDER = [
+    "в лотке",
+    "в гофре",
+    "в кабель-канале",
+    "в трубе",
+    "в штрабе",
+    "в траншее/земле",
+    "способ не указан",
+]
+
+_CABLE_CARRIER_KEYS = (
+    "лоток", "короб", "кабель-канал", "кабель канал", "гофр", "лестниц",
+    "консоль", "кронштейн", "профил", "перфорир", "упмк", "держатель", "хому",
+)
+
+
+def _height_of(it: dict) -> float | None:
+    """Высота монтажа из примечаний/способа прокладки/направления («на отметке +7,8 м»)."""
+    blob = " ".join(str(it.get(k) or "") for k in ("note", "laying", "to"))
+    m = _HEIGHT_RE.search(blob)
+    if m:
+        try:
+            return float(m.group(1).replace(",", "."))
+        except ValueError:
+            return None
+    return None
+
+
+def _band_of(h: float | None) -> str:
+    if h is None:
+        return "высота не указана"
+    if h < 5:
+        return "от 0 м до 5 м"
+    if h < 8:
+        return "от 5 м до 8 м"
+    if h <= 12:
+        return "от 8 м до 12 м"
+    return "более 12 м"
+
+
+def _laying_of(it: dict) -> str:
+    blob = norm(" ".join(str(it.get(k) or "") for k in ("laying", "note", "to", "name")))
+    if "лотк" in blob:
+        return "в лотке"
+    if "гофр" in blob:
+        return "в гофре"
+    if any(k in blob for k in ("кабель-канал", "кабель канал", "кабельный канал", "короб")):
+        return "в кабель-канале"
+    if "труб" in blob:
+        return "в трубе"
+    if "штраб" in blob:
+        return "в штрабе"
+    if "транше" in blob or "земл" in blob or "грунт" in blob:
+        return "в траншее/земле"
+    return "способ не указан"
+
+
+def _is_cable_carrier(it: dict) -> bool:
+    """Кабеленесущие системы: лотки, короба, кабель-каналы, гофра, трубы и т.п."""
+    blob = norm(" ".join(str(it.get(k) or "") for k in ("name", "mark", "type")))
+    if not blob:
+        return False
+    if "термоусаж" in blob or "термоусад" in blob or "патруб" in blob:
+        return False
+    if any(k in blob for k in _CABLE_CARRIER_KEYS):
+        return True
+    if "труб" in blob:
+        return True
+    return False
+
+
 def _write_bov(db: Session, audit: Audit, path: Path) -> None:
     """Ведомость объёмов работ (ВОР) по форме заказчика.
 
-    Структура повторяет образец: шапка с утверждением, титул «Ведомость объёмов
-    работ», блок «Объект / Шифр документации / Тип ведомости», таблица из 10
-    колонок, разделы «Оборудование и материалы» / «Кабельные изделия и провода»,
-    подписи «Составил / Проверил». Заполняется ТОЛЬКО разобранными строками
-    спецификации и кабельного журнала — работы и нормы расхода не выдумываются.
+    Форма повторяет образец (шапка с утверждением, титул, блок реквизитов,
+    10-колоночная таблица, подписи). Разделы:
+      — Оборудование и материалы (все позиции спецификации);
+      — Кабельные изделия и провода (кабельная продукция из спецификации);
+      — Монтаж кабеленесущих систем — с разбивкой по высотным отметкам;
+      — Монтаж кабеля — с разбивкой по способу прокладки и высотным отметкам.
+    Высота берётся из примечаний/«способа прокладки»/«направления» («на отметке
+    +7,8 м»); если высота/способ не указаны — строка помечается «не указано».
+    Никакие работы и нормы расхода не выдумываются.
     """
     from collections import defaultdict
 
@@ -304,24 +389,28 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
     def _mark(it: dict) -> str:
         return re.sub(r"\s+", " ", (it.get("manufacturer") or it.get("mark") or it.get("type") or "")).strip()
 
-    # разбивка на разделы (только материальные строки: с количеством/длиной)
+    def _is_cable(it: dict) -> bool:
+        return looks_like_cable(" ".join(str(it.get(k) or "") for k in ("name", "mark", "type", "manufacturer")))
+
+    # разбивка строк спецификации (только материальные — с количеством/длиной;
+    # строки оглавления «Общие данные», «План расположения…» не имеют количества)
     equip: list[dict] = []
+    carrier: list[dict] = []
     cab_spec: list[dict] = []
     for it in items:
         if not _name(it):
             continue
-        # строки оглавления/служебные («Общие данные», «План расположения…»)
-        # не имеют количества — их не включаем в ведомость
         if it.get("qty") is None and it.get("length") is None:
             continue
-        if looks_like_cable(" ".join(str(it.get(k) or "") for k in ("name", "mark", "type", "manufacturer"))):
+        if _is_cable(it):
             cab_spec.append(it)
+        elif _is_cable_carrier(it):
+            carrier.append(it)
         else:
             equip.append(it)
 
-    # кабели из журнала — сумма длин по марке (только трассы с длиной;
-    # позиции без длины остаются в разделе спецификации выше)
-    by_mark: dict[str, float] = defaultdict(float)
+    # кабели журнала — группируем по (способ прокладки, высотная отметка) → марка → сумма длин
+    cable_groups: dict[tuple[str, str], dict[str, float]] = defaultdict(lambda: defaultdict(float))
     journal_missing = 0
     for c in cables:
         val = c.get("length")
@@ -332,7 +421,9 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
         key = _mark(c) or _name(c)
         if not key:
             continue
-        by_mark[key] += float(val)
+        laying = _laying_of(c)
+        band = _band_of(_height_of(c))
+        cable_groups[(laying, band)][key] += float(val)
 
     # стили
     thin = Side(style="thin", color="FF808080")
@@ -341,6 +432,8 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
     head_fill = PatternFill("solid", fgColor="FFD9D9D9")
     sect_fill = PatternFill("solid", fgColor="FFF2F2F2")
     sect_font = Font(bold=True, size=11)
+    sub_font = Font(italic=True, bold=True, size=10, color="FF404040")
+    sub_fill = PatternFill("solid", fgColor="FFFAFAFA")
     wrap = Alignment(wrap_text=True, vertical="top")
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     small_gray = Font(size=9, italic=True, color="FF808080")
@@ -373,9 +466,6 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
     ws["F10"].alignment = Alignment(horizontal="right")
 
     # ---------- реквизиты ----------
-    company = db.get(Setting, "company_name")
-    company = (company.value if company else "") or ""
-
     def _requisite(row: int, text: str) -> None:
         ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=6)
         ws.cell(row, 2, text)
@@ -414,10 +504,17 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
         nonlocal row_i
         ws.cell(row_i, 2, title)
         ws.cell(row_i, 2).font = sect_font
-        ws.cell(row_i, 2).fill = sect_fill
         for col in range(1, 11):
             ws.cell(row_i, col).border = border
             ws.cell(row_i, col).fill = sect_fill
+        row_i += 1
+
+    def _sub(title: str) -> None:
+        nonlocal row_i
+        ws.cell(row_i, 2, title)
+        ws.cell(row_i, 2).font = sub_font
+        for col in range(1, 11):
+            ws.cell(row_i, col).fill = sub_fill
         row_i += 1
 
     def _row(name: str, unit: str, qty, mark: str, source: str, note: str, pos: str = "", mat_no: str = ""):
@@ -442,66 +539,89 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
         row_i += 1
         n += 1
 
-    if not equip and not cab_spec and not by_mark:
+    def _material_rows(materials: list[dict], source: str) -> None:
+        nonlocal row_i
+        mno = 0
+        for it in materials:
+            name = _name(it)
+            mark = _mark(it)
+            if mark and mark.lower() in name.lower():
+                mark = ""
+            qty = it.get("qty") if it.get("qty") is not None else it.get("length")
+            unit = it.get("unit") or ("м" if it.get("length") is not None and it.get("qty") is None else "шт")
+            mno += 1
+            _row(name, unit, qty, mark, source, it.get("note") or "", it.get("pos") or "", f"{mno}.")
+
+    if not equip and not carrier and not cab_spec and not cable_groups:
         ws.cell(row_i, 2, "Исходных данных для ведомости объёмов нет. Файл не выдумывался.")
         ws.merge_cells(start_row=row_i, start_column=2, end_row=row_i, end_column=10)
         row_i += 1
     else:
-        # 1) Оборудование и материалы
+        # 1) Оборудование и материалы — все позиции спецификации, не кабель и не кабеленесущие
         if equip:
             _section("Оборудование и материалы")
-            mno = 0
-            for it in equip:
-                name = _name(it)
-                mark = _mark(it)
-                if mark and mark.lower() in name.lower():
-                    mark = ""  # марка уже в названии — не дублируем
-                qty = it.get("qty") if it.get("qty") is not None else it.get("length")
-                unit = it.get("unit") or ("м" if it.get("length") is not None and it.get("qty") is None else "шт")
-                mno += 1
-                _row(name, unit, qty, mark, "спецификация", it.get("note") or "", it.get("pos") or "", f"{mno}.")
+            _material_rows(equip, "спецификация")
 
-        # 2) Кабельные изделия и провода
-        if cab_spec or by_mark:
+        # 2) Кабельные изделия и провода (поставка из спецификации)
+        if cab_spec:
             _section("Кабельные изделия и провода")
-            mno = 0
-            for it in cab_spec:
-                name = _name(it)
-                mark = _mark(it)
-                if not mark or mark.lower() in name.lower():
-                    mark = ""
-                qty = it.get("length") if it.get("length") is not None else it.get("qty")
-                unit = it.get("unit") or ("м" if it.get("length") is not None else "шт")
-                mno += 1
-                _row(name, unit, qty, mark, "спецификация", it.get("note") or "", it.get("pos") or "", f"{mno}.")
-            for key, val in sorted(by_mark.items(), key=lambda kv: -kv[1]):
-                _row(
-                    f"Прокладка кабеля {key}",
-                    "м",
-                    round(val, 2),
-                    key,
-                    "кабельный журнал",
-                    "",
-                    "",
-                )
+            _material_rows(cab_spec, "спецификация")
+
+        # 3) Монтаж кабеленесущих систем — по высотным отметкам
+        if carrier:
+            _section("Монтаж кабеленесущих систем")
+            for band in HEIGHT_BAND_ORDER:
+                band_items = [i for i in carrier if _band_of(_height_of(i)) == band]
+                if not band_items:
+                    continue
+                _sub(f"— высота: {band}")
+                for it in band_items:
+                    name = _name(it)
+                    mark = _mark(it)
+                    if mark and mark.lower() in name.lower():
+                        mark = ""
+                    qty = it.get("qty") if it.get("qty") is not None else it.get("length")
+                    unit = it.get("unit") or ("м" if it.get("length") is not None and it.get("qty") is None else "шт")
+                    work = name
+                    low = name.lower()
+                    if not low.startswith(("монтаж", "укладк", "прокладк", "установк")):
+                        work = f"Монтаж: {name}"
+                    _row(work, unit, qty, mark, "спецификация", it.get("note") or "", it.get("pos") or "", "")
+
+        # 4) Монтаж кабеля — по способу прокладки × высотным отметкам
+        if cable_groups:
+            _section("Монтаж кабеля")
+            for laying in LAYING_ORDER:
+                for band in HEIGHT_BAND_ORDER:
+                    marks = cable_groups.get((laying, band))
+                    if not marks:
+                        continue
+                    lay = laying if laying != "способ не указан" else "способ прокладки не указан"
+                    bnd = band if band != "высота не указана" else "высота не указана"
+                    _sub(f"— {lay}; {bnd}")
+                    for key, val in sorted(marks.items(), key=lambda kv: -kv[1]):
+                        _row(f"Прокладка кабеля {key}", "м", round(val, 2), key, "кабельный журнал", "", "", "")
+
         if journal_missing:
-            ws.cell(row_i, 2, f"Строк кабельного журнала без длины (не вошли в сумму): {journal_missing}")
+            ws.cell(row_i, 2, f"Строк кабельного журнала без длины (не вошли в суммы): {journal_missing}")
             ws.cell(row_i, 2).font = small_gray
             row_i += 1
 
     # ---------- подписи ----------
     row_i += 1
-    ws.cell(row_i, 1, f"Составил: ____________________ (Ф.И.О.)")
+    ws.cell(row_i, 1, "Составил: ____________________ (Ф.И.О.)")
     ws.merge_cells(start_row=row_i, start_column=1, end_row=row_i, end_column=10)
     row_i += 1
-    ws.cell(row_i, 1, f"Проверил: ____________________ (Ф.И.О.)")
+    ws.cell(row_i, 1, "Проверил: ____________________ (Ф.И.О.)")
     ws.merge_cells(start_row=row_i, start_column=1, end_row=row_i, end_column=10)
     row_i += 2
     ws.cell(row_i, 1, (
         f"Сформировано системой «Ревизор НТД» {datetime.utcnow().strftime('%d.%m.%Y %H:%M')} "
         f"по разобранным строкам спецификации и кабельного журнала. "
         f"Источники: {', '.join(sources) if sources else 'нет'}. "
-        f"Работы и нормы расхода, отсутствующие во входных данных, не добавлялись."
+        f"Все позиции спецификации с количеством/длиной включены в ведомость. "
+        f"Высота монтажа и способ прокладки берутся из примечаний/колонок входных данных; "
+        f"если не указаны — строка помечена «не указано». Работы и нормы расхода не добавлялись."
     ))
     ws.cell(row_i, 1).font = small_gray
     ws.merge_cells(start_row=row_i, start_column=1, end_row=row_i, end_column=10)

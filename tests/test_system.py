@@ -12,7 +12,12 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.seed import init_db
-from app.services.checks import check_cable_mark, check_spec_journal_names, check_spec_journal_qty
+from app.services.checks import (
+    check_cable_mark,
+    check_spec_journal_names,
+    check_spec_journal_qty,
+    check_spec_journal_section,
+)
 from app.services.parsers import parse_file
 
 
@@ -36,6 +41,8 @@ def test_parsers_and_checks():
     assert_true(names["status"] == "done", names)
     qty = check_spec_journal_qty(sp["items"], jn["cables"] or jn["items"], 5)
     assert_true(qty["status"] == "done", qty)
+    sec = check_spec_journal_section(sp["items"], jn["cables"] or jn["items"])
+    assert_true(sec["status"] == "done", sec)
     # должно быть расхождение 120 vs 95 по 3х2,5 и/или кабель журнала КВВГ
     assert_true(any("Расхождение" in f["title"] or "отсутствует" in f["title"] for f in names["findings"] + qty["findings"]),
                 f"ожидались расхождения, получено: {names} {qty}")

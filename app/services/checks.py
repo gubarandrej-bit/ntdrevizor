@@ -404,6 +404,110 @@ EQUIP_TOKEN_RE = re.compile(
 )
 
 
+def _brand_no_section(i: dict) -> str:
+    """Марка кабеля без сечения (для сопоставления типа по строкам)."""
+    brand = _cable_brand(i)
+    if brand:
+        return _strip_section_from_mark(brand)
+    return _strip_section_from_mark(i.get("name") or "")
+
+
+def _item_section(i: dict) -> str:
+    """Сечение из записи: «3x2.5» / «1x2.0» и т.п.; '' если не указано."""
+    parsed = i.get("section") or parse_section(
+        " ".join(str(i.get(k) or "") for k in ("mark", "manufacturer", "name", "type"))
+    )
+    if parsed and parsed.get("mm2"):
+        cores = parsed.get("cores")
+        return f"{cores}x{parsed['mm2']}" if cores else str(parsed["mm2"])
+    return ""
+
+
+def check_spec_journal_section(spec_items: list[dict], journal: list[dict]) -> dict[str, Any]:
+    """Сверка типа (марки) и сечения кабеля между спецификацией и журналом."""
+    if not spec_items:
+        return _skip("Спецификация не разобрана — тип/сечение сверить нельзя.")
+    if not journal:
+        return _skip("Кабельный журнал не разобран — тип/сечение сверить нельзя.")
+    spec_cables = [i for i in spec_items if _is_cable_item(i) and _is_material_line(i)]
+    if not spec_cables:
+        return _skip("В спецификации не выделены кабельные позиции с количеством/длиной.")
+
+    spec_sec: dict[str, set] = defaultdict(set)
+    spec_type: dict[str, set] = defaultdict(set)
+    for i in spec_cables:
+        b = _brand_no_section(i)
+        if not b:
+            continue
+        s = _item_section(i)
+        if s:
+            spec_sec[b].add(s)
+        t = (i.get("type") or "").strip()
+        if t:
+            spec_type[b].add(t)
+
+    jour_sec: dict[str, set] = defaultdict(set)
+    jour_type: dict[str, set] = defaultdict(set)
+    for i in journal:
+        b = _brand_no_section(i)
+        if not b:
+            continue
+        s = _item_section(i)
+        if s:
+            jour_sec[b].add(s)
+        t = (i.get("type") or "").strip()
+        if t:
+            jour_type[b].add(t)
+
+    findings = []
+    common = set(spec_sec) & set(jour_sec)
+    for b in sorted(common):
+        ss, js = spec_sec[b], jour_sec[b]
+        if ss and js and ss != js:
+            findings.append(
+                finding(
+                    "critical",
+                    "Сечение кабеля в журнале не совпадает со спецификацией",
+                    f"«{b}»: спецификация {', '.join(sorted(ss))}, журнал {', '.join(sorted(js))}. "
+                    f"Сечение должно совпадать — расхождение влияет на допустимый ток и автоматы защиты.",
+                    ["ГОСТ 21.110-2013", "ГОСТ 21.613-2014"],
+                    evidence=f"spec={sorted(ss)}, journal={sorted(js)}",
+                )
+            )
+        elif ss and not js:
+            findings.append(
+                finding(
+                    "noncritical",
+                    "В журнале не указано сечение кабеля",
+                    f"«{b}»: в спецификации сечение {', '.join(sorted(ss))}, в журнале не указано.",
+                    ["ГОСТ 21.613-2014"],
+                )
+            )
+        elif not ss and js:
+            findings.append(
+                finding(
+                    "noncritical",
+                    "В спецификации не указано сечение кабеля",
+                    f"«{b}»: в журнале сечение {', '.join(sorted(js))}, в спецификации не указано.",
+                    ["ГОСТ 21.110-2013"],
+                )
+            )
+    # тип/марка: сравниваем поле «тип», когда оно заполнено в обоих документах
+    for b in sorted(set(spec_type) & set(jour_type)):
+        st, jt = spec_type[b], jour_type[b]
+        if st and jt and not (st & jt):
+            findings.append(
+                finding(
+                    "noncritical",
+                    "Тип кабеля в журнале отличается от спецификации",
+                    f"«{b}»: тип в спецификации {', '.join(sorted(st))}, в журнале {', '.join(sorted(jt))}.",
+                    ["ГОСТ 21.110-2013", "ГОСТ 21.613-2014"],
+                    evidence=f"spec_type={sorted(st)}, journal_type={sorted(jt)}",
+                )
+            )
+    return {"status": "done", "reason": "", "findings": findings}
+
+
 def check_scheme_vs_spec(spec_items: list[dict], scheme_files: list[dict]) -> dict[str, Any]:
     if not spec_items:
         return _skip("Спецификация не разобрана — сверять оборудование со схем не с чем.")

@@ -28,6 +28,7 @@ from app.services.checks import (
     check_scheme_vs_spec,
     check_spec_journal_names,
     check_spec_journal_qty,
+    check_spec_journal_section,
     check_spz_category,
 )
 from app.services.classify import classify_file
@@ -251,6 +252,11 @@ def _run(db: Session, audit: Audit, talk: Callable) -> None:
     r = check_spec_journal_qty(spec_items, journal_items, tol_qty)
     _store(db, audit, "SPEC_VS_JOURNAL_QTY", r["status"], r.get("reason", ""), r.get("findings", []))
     _announce(talk, "SPEC_VS_JOURNAL_QTY", r)
+
+    talk("Сверка типа и сечения кабеля журнал/спецификация…")
+    r = check_spec_journal_section(spec_items, journal_items)
+    _store(db, audit, "SPEC_VS_JOURNAL_SECTION", r["status"], r.get("reason", ""), r.get("findings", []))
+    _announce(talk, "SPEC_VS_JOURNAL_SECTION", r)
 
     talk("Сверка оборудования на схемах со спецификацией…")
     r = check_scheme_vs_spec(spec_items, scheme_files)
