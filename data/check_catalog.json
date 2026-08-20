@@ -74,6 +74,13 @@
       "ai": false
     },
     {
+      "code": "DETECTOR_SPACING",
+      "title": "Расстановка пожарных извещателей по СП 484.1311500.2020",
+      "group": "пожарная автоматика",
+      "requires": ["specification"],
+      "ai": false
+    },
+    {
       "code": "CABLE_SECTION",
       "title": "Выбор сечения кабеля по нагрузке и ПУЭ/ГОСТ/СП",
       "group": "кабели",

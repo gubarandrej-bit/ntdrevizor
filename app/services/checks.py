@@ -858,6 +858,27 @@ def check_cable_mark(items: list[dict], systems: list[str], full_text: str) -> d
                     evidence=mark,
                 )
             )
+
+    # информационная рекомендация по маркам (из справочника типовых марок)
+    catalog = engineering_tables().get("cable_catalog", {}).get("by_system", {})
+    if need_fr:
+        fr_missing = [c for c in cables if not is_fire_resistant_mark(
+            " ".join(str(c.get(k) or "") for k in ("mark", "type", "name"))
+        ) and _looks_spz_cable(c, full_text)]
+        if fr_missing:
+            rec = catalog.get("PS") or catalog.get("SOUE")
+            if rec:
+                add(
+                    finding(
+                        "info",
+                        "Рекомендуемые марки кабелей для систем ПС/СОУЭ",
+                        f"Для линий СПЗ, сохраняющих работоспособность в пожаре, применяются огнестойкие кабели. "
+                        f"Типовые марки ({rec.get('label', '')}): {', '.join(rec.get('recommended', []))}. "
+                        f"Конкретная марка определяется проектом и ТУ — рекомендация справочная.",
+                        ["СП 6.13130.2025", "ГОСТ 31565-2012"],
+                        evidence="cable_catalog",
+                    )
+                )
     return {"status": "done", "reason": "", "findings": findings}
 
 
@@ -865,6 +886,125 @@ def _looks_spz_cable(c: dict, full_text: str) -> bool:
     blob = norm(" ".join(str(c.get(k) or "") for k in ("name", "mark", "note", "from", "to")))
     keys = ("пож", "соуэ", "апс", "спс", "ппу", "ппкп", "оповещ", "пожаротуш", "дымоуд", "спз")
     return any(k in blob for k in keys)
+
+
+def _is_detector(i: dict) -> bool:
+    """Пожарный извещатель (дымовой/тепловой/ручной/комбинированный)."""
+    blob = norm(" ".join(str(i.get(k) or "") for k in ("name", "mark", "type")))
+    if not blob:
+        return False
+    if "извещател" in blob:
+        return True
+    if re.search(r"\bип\s*2\d\d|\bипр\b|\bипт\b|дип-", blob):
+        return True
+    return False
+
+
+def _detector_kind(i: dict) -> str:
+    blob = norm(" ".join(str(i.get(k) or "") for k in ("name", "mark", "type")))
+    if "ручн" in blob or "ипр" in blob:
+        return "manual"
+    if "теплов" in blob or "ипт" in blob or re.search(r"\bип\s*1\d\d", blob):
+        return "heat"
+    if "комбинир" in blob:
+        return "combined"
+    if "дым" in blob or re.search(r"\bип\s*212\b|дип-", blob):
+        return "smoke"
+    return "unknown"
+
+
+def check_detector_spacing(spec_items: list[dict], full_text: str) -> dict[str, Any]:
+    """Расстановка пожарных извещателей по СП 484.1311500.2020.
+
+    Считает извещатели по типам (информационно) и, если в тексте есть размерные
+    данные помещений (площади), сверяет требуемое минимальное число извещателей
+    с фактическим по табл. А.1/А.2. Без размерных данных проверка не проводится —
+    данные не выдумываются.
+    """
+    detectors = [i for i in spec_items if _is_detector(i) and _is_material_line(i)]
+    if not detectors:
+        return _skip("В спецификации не найдены пожарные извещатели.")
+
+    tab = engineering_tables().get("sp484_detectors", {})
+    smoke_rows = tab.get("smoke", [])
+    heat_rows = tab.get("heat", [])
+
+    kinds: dict[str, int] = defaultdict(int)
+    for i in detectors:
+        k = _detector_kind(i)
+        qty = i.get("qty") if i.get("qty") is not None else (i.get("length") or 0)
+        kinds[k] += int(qty or 0)
+
+    findings = [
+        finding(
+            "info",
+            "Извещатели в спецификации (по типам)",
+            "Сводка: "
+            + "; ".join(f"{_detector_label(k)} — {v} шт." for k, v in sorted(kinds.items()))
+            + ".",
+            ["СП 484.1311500.2020"],
+        )
+    ]
+
+    # размерные данные помещений: площади (м2/м²/кв.м) и высоты
+    areas = [parse_float(x) for x in re.findall(r"(\d+(?:[.,]\d+)?)\s*(?:м\s*2|м²|кв\.?\s*м)", full_text)]
+    areas = [a for a in areas if a and 1 < a < 100000]
+    heights = [parse_float(x) for x in re.findall(r"[вВ]ысот[а-я]*\s*(?:помещ[а-я]*)?\s*[-—]?\s*(\d+(?:[.,]\d+)?)", full_text)]
+    heights = [h for h in heights if h and 1 < h < 30]
+
+    if not areas:
+        return {
+            "status": "skipped",
+            "reason": (
+                "Нет размерных данных помещений (площадей в м²). "
+                "Расстановка извещателей по СП 484 табл. А.1/А.2 не проверяется — данные не выдумываются."
+            ),
+            "findings": findings,
+        }
+
+    h = max(heights) if heights else 3.0
+    smoke_norm = next((r for r in smoke_rows if float(r["height"].split()[1].replace(",", ".")) >= h), None)
+    heat_norm = next((r for r in heat_rows if float(r["height"].split()[1].replace(",", ".")) >= h), None)
+
+    total_area = sum(areas)
+    have_smoke = kinds.get("smoke", 0) + kinds.get("unknown", 0)
+    if smoke_norm and have_smoke > 0:
+        need = total_area / float(smoke_norm["area_m2"])
+        if have_smoke < need:
+            findings.append(
+                finding(
+                    "critical",
+                    "Извещателей меньше требуемого по площади",
+                    f"Суммарная площадь помещений {total_area:.0f} м², высота до {h:g} м → требуется не менее {need:.0f} дымовых ИП (табл. А.1), в спецификации {have_smoke}. "
+                    f"Оценка суммарная и не заменяет план расстановки.",
+                    ["СП 484.1311500.2020 табл. А.1"],
+                    evidence=f"area={total_area:.0f}, need={need:.0f}, have={have_smoke}",
+                )
+            )
+    if heat_norm and kinds.get("heat", 0) > 0:
+        need = total_area / float(heat_norm["area_m2"])
+        have = kinds.get("heat", 0)
+        if have < need:
+            findings.append(
+                finding(
+                    "critical",
+                    "Тепловых извещателей меньше требуемого по площади",
+                    f"Суммарная площадь {total_area:.0f} м², высота до {h:g} м → требуется не менее {need:.0f} тепловых ИП (табл. А.2), в спецификации {have}.",
+                    ["СП 484.1311500.2020 табл. А.2"],
+                    evidence=f"area={total_area:.0f}, need={need:.0f}, have={have}",
+                )
+            )
+    return {"status": "done", "reason": "", "findings": findings}
+
+
+def _detector_label(kind: str) -> str:
+    return {
+        "smoke": "дымовые",
+        "heat": "тепловые",
+        "manual": "ручные",
+        "combined": "комбинированные",
+        "unknown": "тип не определён",
+    }.get(kind, kind)
 
 
 # ---------- сечение ----------

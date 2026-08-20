@@ -19,6 +19,7 @@ from app.services.checks import (
     check_battery,
     check_cable_mark,
     check_cable_section,
+    check_detector_spacing,
     check_completeness,
     check_laying,
     check_outdated_ntd_refs,
@@ -274,6 +275,11 @@ def _run(db: Session, audit: Audit, talk: Callable) -> None:
     r["findings"] = list(r.get("findings") or []) + list(extra.get("findings") or [])
     _store(db, audit, "CABLE_MARK", r["status"], r.get("reason", ""), r.get("findings", []))
     _announce(talk, "CABLE_MARK", r)
+
+    talk("Расстановка пожарных извещателей по СП 484…")
+    r = check_detector_spacing(spec_items, full_text)
+    _store(db, audit, "DETECTOR_SPACING", r["status"], r.get("reason", ""), r.get("findings", []))
+    _announce(talk, "DETECTOR_SPACING", r)
 
     talk("Проверка сечений по нагрузке и ПУЭ…")
     r = check_cable_section(spec_items + journal_items, calc_text)

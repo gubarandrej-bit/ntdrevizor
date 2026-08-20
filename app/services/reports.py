@@ -392,6 +392,9 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
     def _is_cable(it: dict) -> bool:
         return looks_like_cable(" ".join(str(it.get(k) or "") for k in ("name", "mark", "type", "manufacturer")))
 
+    def _is_material_row(it: dict) -> bool:
+        return it.get("qty") is not None or it.get("length") is not None
+
     # разбивка строк спецификации (только материальные — с количеством/длиной;
     # строки оглавления «Общие данные», «План расположения…» не имеют количества)
     equip: list[dict] = []
@@ -599,8 +602,44 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
                     lay = laying if laying != "способ не указан" else "способ прокладки не указан"
                     bnd = band if band != "высота не указана" else "высота не указана"
                     _sub(f"— {lay}; {bnd}")
+                    verb = {
+                        "в гофре": "Затяжка кабеля",
+                        "в трубе": "Затяжка кабеля",
+                    }.get(laying, "Прокладка кабеля")
+                    place = {"в лотке": "в лотке", "в гофре": "в гофротрубе", "в трубе": "в трубе"}.get(laying, "")
                     for key, val in sorted(marks.items(), key=lambda kv: -kv[1]):
-                        _row(f"Прокладка кабеля {key}", "м", round(val, 2), key, "кабельный журнал", "", "", "")
+                        _row(f"{verb} {key} {place}".strip(), "м", round(val, 2), key, "кабельный журнал", "", "", "")
+
+        # 5) Пусконаладочные работы — по типам оборудования спецификации.
+        #    Виды ПНР выведены из типов оборудования; количества требуют
+        #    подтверждения (в спецификации как отдельная позиция отсутствуют).
+        pnr_lines: list[tuple[str, str, str]] = []
+        n_det = 0
+        n_ppk = 0
+        n_sw = 0
+        for it in items:
+            blob = norm(" ".join(str(it.get(k) or "") for k in ("name", "mark", "type")))
+            if not _is_material_row(it):
+                continue
+            q = it.get("qty") if it.get("qty") is not None else (it.get("length") or 0)
+            q = int(q or 0)
+            if re.search(r"извещател|дип-|\bипт\b|\bипр\b|\bип\s*2\d\d", blob):
+                n_det += q
+            elif any(k in blob for k in ("прибор приемно-контрол", "ппкп", "ппк", "блок", "контроллер", "расширител", "модуль")):
+                n_ppk += q
+            elif any(k in blob for k in ("сервер", "арм", "монитор", "коммутатор")):
+                n_sw += q
+        if n_ppk:
+            pnr_lines.append(("Программирование приборов ППКП/блоков (адресация, конфигурация)", "шт", str(n_ppk)))
+        if n_det:
+            pnr_lines.append(("Адресация и проверка извещателей (по типам)", "шт", str(n_det)))
+        if n_sw:
+            pnr_lines.append(("Настройка программного обеспечения верхнего уровня", "компл", str(n_sw)))
+        pnr_lines.append(("Проверка работоспособности системы, протокол испытаний", "компл", "1"))
+        if pnr_lines:
+            _section("Пусконаладочные работы")
+            for name, unit, qty in pnr_lines:
+                _row(name, unit, qty, "", "выведено из спецификации", "", "", "")
 
         if journal_missing:
             ws.cell(row_i, 2, f"Строк кабельного журнала без длины (не вошли в суммы): {journal_missing}")
