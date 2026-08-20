@@ -834,6 +834,9 @@ def _map_headers(headers: list[Any]) -> dict[str, int]:
         for key, aliases in HEADER_ALIASES.items():
             if key in mapped:
                 continue
+            # «Масса ед., кг» — это масса, а не единица измерения
+            if key == "unit" and "масс" in h:
+                continue
             if any(a in h for a in aliases):
                 mapped[key] = idx
                 break

@@ -1,17 +1,18 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import Audit, AuditFile, CheckResult, Finding
-from app.util import loads
+from app.models import Audit, AuditFile, CheckResult, Finding, Setting
+from app.util import loads, looks_like_cable
 
 
 def build_reports(db: Session, audit: Audit) -> dict[str, str]:
@@ -272,92 +273,240 @@ def _write_xlsx(db: Session, audit: Audit, path: Path) -> None:
 
 
 def _write_bov(db: Session, audit: Audit, path: Path) -> None:
-    """Ведомость объёмов — только из разобранных спецификации и журнала. Ничего не добавляется."""
+    """Ведомость объёмов работ (ВОР) по форме заказчика.
+
+    Структура повторяет образец: шапка с утверждением, титул «Ведомость объёмов
+    работ», блок «Объект / Шифр документации / Тип ведомости», таблица из 10
+    колонок, разделы «Оборудование и материалы» / «Кабельные изделия и провода»,
+    подписи «Составил / Проверил». Заполняется ТОЛЬКО разобранными строками
+    спецификации и кабельного журнала — работы и нормы расхода не выдумываются.
+    """
     from collections import defaultdict
 
     files = db.query(AuditFile).filter(AuditFile.audit_id == audit.id).all()
-    items = []
-    cables = []
-    sources = []
+    items: list[dict] = []
+    cables: list[dict] = []
+    sources: list[str] = []
     for f in files:
         data = loads(f.extracted_json, {})
         if f.classified_as == "specification":
-            items.extend(data.get("items") or data.get("equipment") or [])
+            items.extend(data.get("items") or [])
+            # в объединённом PDF кабельные строки лежат в этом же файле
+            cables.extend(data.get("cables") or [])
             sources.append(f.filename)
         if f.classified_as == "cable_journal":
             cables.extend(data.get("cables") or data.get("items") or [])
             sources.append(f.filename)
 
+    def _name(it: dict) -> str:
+        return re.sub(r"\s+", " ", (it.get("name") or it.get("mark") or it.get("type") or "")).strip()
+
+    def _mark(it: dict) -> str:
+        return re.sub(r"\s+", " ", (it.get("manufacturer") or it.get("mark") or it.get("type") or "")).strip()
+
+    # разбивка на разделы (только материальные строки: с количеством/длиной)
+    equip: list[dict] = []
+    cab_spec: list[dict] = []
+    for it in items:
+        if not _name(it):
+            continue
+        # строки оглавления/служебные («Общие данные», «План расположения…»)
+        # не имеют количества — их не включаем в ведомость
+        if it.get("qty") is None and it.get("length") is None:
+            continue
+        if looks_like_cable(" ".join(str(it.get(k) or "") for k in ("name", "mark", "type", "manufacturer"))):
+            cab_spec.append(it)
+        else:
+            equip.append(it)
+
+    # кабели из журнала — сумма длин по марке (только трассы с длиной;
+    # позиции без длины остаются в разделе спецификации выше)
+    by_mark: dict[str, float] = defaultdict(float)
+    journal_missing = 0
+    for c in cables:
+        val = c.get("length")
+        if val is None:
+            if c.get("qty") is None:
+                journal_missing += 1
+            continue
+        key = _mark(c) or _name(c)
+        if not key:
+            continue
+        by_mark[key] += float(val)
+
+    # стили
+    thin = Side(style="thin", color="FF808080")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head_font = Font(bold=True, size=10)
+    head_fill = PatternFill("solid", fgColor="FFD9D9D9")
+    sect_fill = PatternFill("solid", fgColor="FFF2F2F2")
+    sect_font = Font(bold=True, size=11)
+    wrap = Alignment(wrap_text=True, vertical="top")
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    small_gray = Font(size=9, italic=True, color="FF808080")
+
     wb = Workbook()
     ws = wb.active
     ws.title = "ВОР"
-    ws["A1"] = "Ведомость объёмов работ"
-    ws["A1"].font = Font(bold=True, size=14)
-    ws["A2"] = (
-        "Сформирована только по разобранным строкам спецификации и кабельного журнала. "
-        "Нормы расхода, коэффициенты и работы, которых нет во входных данных, не добавлялись."
-    )
-    ws.merge_cells("A2:G2")
-    ws["A3"] = "Источники: " + (", ".join(sources) if sources else "нет разобранных спецификации/журнала")
 
-    headers = ["№", "Наименование работ / ресурсов", "Ед.", "Кол-во", "Марка / тип", "Основание", "Примечание"]
+    # ---------- шапка ----------
+    ws["I2"] = "Приложение №1\nк Техническому заданию №____"
+    ws["I2"].alignment = Alignment(wrap_text=True, vertical="top")
+    ws["I3"] = "УТВЕРЖДАЮ"
+    ws["I3"].font = Font(bold=True)
+    ws["I3"].alignment = Alignment(horizontal="left")
+    ws.merge_cells("H4:J4")
+    ws["H4"] = "____________________________\n(должность, Ф.И.О.)"
+    ws["H4"].alignment = wrap
+    ws.merge_cells("H5:J5")
+    ws["H5"] = "«___» ______________ 20__ г."
+
+    # ---------- титул ----------
+    ws.merge_cells("A8:J8")
+    ws["A8"] = "Ведомость объемов работ №______ от __.__.____"
+    ws["A8"].font = Font(bold=True, size=13)
+    ws["A8"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.merge_cells("A9:J9")
+    ws["A9"] = "на выполнение комплекса работ строительно-монтажных работ"
+    ws["A9"].alignment = Alignment(horizontal="center", vertical="center")
+    ws["F10"] = "Лист 1"
+    ws["F10"].alignment = Alignment(horizontal="right")
+
+    # ---------- реквизиты ----------
+    company = db.get(Setting, "company_name")
+    company = (company.value if company else "") or ""
+
+    def _requisite(row: int, text: str) -> None:
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=6)
+        ws.cell(row, 2, text)
+
+    _requisite(11, f"Объект: {audit.object_name or '—'}")
+    _requisite(12, f"Шифр документации: {'—'}")
+    _requisite(13, "Тип ведомости: Новые работы")
+    _requisite(14, "Причина внесения изменений / основания для разработки ВОР:")
+    _requisite(15, "Приложения:")
+
+    # ---------- таблица ----------
+    headers = [
+        "№ п/п",
+        "Наименование работы",
+        "Ед. изм. работы",
+        "Объем работы",
+        "№ материала",
+        "Наименование материала",
+        "Ед. изм. материала",
+        "Кол-во материала",
+        "Расчет объема материала",
+        "Примечание\n(Ссылка на чертеж, техническое решение, условия производства работ и пр.)",
+    ]
+    HDR_ROW = 17
     for col, h in enumerate(headers, 1):
-        cell = ws.cell(5, col, h)
-        cell.font = Font(bold=True, color="F2E6C8")
-        cell.fill = PatternFill("solid", fgColor="1B2430")
+        cell = ws.cell(HDR_ROW, col, h)
+        cell.font = head_font
+        cell.fill = head_fill
+        cell.border = border
+        cell.alignment = center
 
-    row_i = 6
-    n = 1
-    if not items and not cables:
-        ws.cell(row_i, 1, "—")
-        ws.merge_cells(start_row=row_i, start_column=2, end_row=row_i, end_column=7)
+    row_i = HDR_ROW + 1
+    n = 1  # № п/п
+
+    def _section(title: str) -> None:
+        nonlocal row_i
+        ws.cell(row_i, 2, title)
+        ws.cell(row_i, 2).font = sect_font
+        ws.cell(row_i, 2).fill = sect_fill
+        for col in range(1, 11):
+            ws.cell(row_i, col).border = border
+            ws.cell(row_i, col).fill = sect_fill
+        row_i += 1
+
+    def _row(name: str, unit: str, qty, mark: str, source: str, note: str, pos: str = "", mat_no: str = ""):
+        nonlocal row_i, n
+        ws.cell(row_i, 1, n).alignment = center
+        ws.cell(row_i, 2, name).alignment = wrap
+        ws.cell(row_i, 3, unit).alignment = center
+        ws.cell(row_i, 4, qty if qty is not None else "нет данных").alignment = center
+        ws.cell(row_i, 5, mat_no).alignment = center
+        ws.cell(row_i, 6, mark).alignment = wrap
+        ws.cell(row_i, 7, unit if mark else "").alignment = center
+        ws.cell(row_i, 8, qty if (mark and qty is not None) else "").alignment = center
+        ws.cell(row_i, 9, "").alignment = center
+        note_full = source
+        if note:
+            note_full += "; " + note
+        if pos:
+            note_full = f"{source} (поз. {pos})" + (f"; {note}" if note else "")
+        ws.cell(row_i, 10, note_full).alignment = wrap
+        for col in range(1, 11):
+            ws.cell(row_i, col).border = border
+        row_i += 1
+        n += 1
+
+    if not equip and not cab_spec and not by_mark:
         ws.cell(row_i, 2, "Исходных данных для ведомости объёмов нет. Файл не выдумывался.")
+        ws.merge_cells(start_row=row_i, start_column=2, end_row=row_i, end_column=10)
+        row_i += 1
     else:
-        for it in items:
-            name = it.get("name") or it.get("mark") or ""
-            if not name:
-                continue
-            qty = it.get("qty") if it.get("qty") is not None else it.get("length")
-            ws.cell(row_i, 1, n)
-            ws.cell(row_i, 2, f"Поставка/монтаж: {name}")
-            ws.cell(row_i, 3, it.get("unit") or ("м" if it.get("length") else "шт"))
-            ws.cell(row_i, 4, qty if qty is not None else "нет данных")
-            ws.cell(row_i, 5, it.get("mark") or it.get("type") or "")
-            ws.cell(row_i, 6, "спецификация")
-            ws.cell(row_i, 7, it.get("note") or "")
-            row_i += 1
-            n += 1
-        # кабели журнала, которых могло не быть как отдельных монтажных строк
-        by_mark: dict[str, float] = defaultdict(float)
-        unit_mark: dict[str, str] = {}
-        missing = 0
-        for c in cables:
-            key = (c.get("mark") or c.get("name") or "").strip()
-            if not key:
-                continue
-            val = c.get("length") if c.get("length") is not None else c.get("qty")
-            if val is None:
-                missing += 1
-                continue
-            by_mark[key] += float(val)
-            unit_mark[key] = "м"
-        if by_mark:
-            ws.cell(row_i, 2, "Кабельные трассы по журналу (сумма длин)")
-            ws.cell(row_i, 2).font = Font(bold=True)
-            row_i += 1
-            for key, val in sorted(by_mark.items()):
-                ws.cell(row_i, 1, n)
-                ws.cell(row_i, 2, f"Прокладка кабеля {key}")
-                ws.cell(row_i, 3, unit_mark[key])
-                ws.cell(row_i, 4, round(val, 2))
-                ws.cell(row_i, 5, key)
-                ws.cell(row_i, 6, "кабельный журнал")
-                row_i += 1
-                n += 1
-        if missing:
-            ws.cell(row_i, 2, f"Строк журнала без длины (не вошли в сумму): {missing}")
+        # 1) Оборудование и материалы
+        if equip:
+            _section("Оборудование и материалы")
+            mno = 0
+            for it in equip:
+                name = _name(it)
+                mark = _mark(it)
+                if mark and mark.lower() in name.lower():
+                    mark = ""  # марка уже в названии — не дублируем
+                qty = it.get("qty") if it.get("qty") is not None else it.get("length")
+                unit = it.get("unit") or ("м" if it.get("length") is not None and it.get("qty") is None else "шт")
+                mno += 1
+                _row(name, unit, qty, mark, "спецификация", it.get("note") or "", it.get("pos") or "", f"{mno}.")
+
+        # 2) Кабельные изделия и провода
+        if cab_spec or by_mark:
+            _section("Кабельные изделия и провода")
+            mno = 0
+            for it in cab_spec:
+                name = _name(it)
+                mark = _mark(it)
+                if not mark or mark.lower() in name.lower():
+                    mark = ""
+                qty = it.get("length") if it.get("length") is not None else it.get("qty")
+                unit = it.get("unit") or ("м" if it.get("length") is not None else "шт")
+                mno += 1
+                _row(name, unit, qty, mark, "спецификация", it.get("note") or "", it.get("pos") or "", f"{mno}.")
+            for key, val in sorted(by_mark.items(), key=lambda kv: -kv[1]):
+                _row(
+                    f"Прокладка кабеля {key}",
+                    "м",
+                    round(val, 2),
+                    key,
+                    "кабельный журнал",
+                    "",
+                    "",
+                )
+        if journal_missing:
+            ws.cell(row_i, 2, f"Строк кабельного журнала без длины (не вошли в сумму): {journal_missing}")
+            ws.cell(row_i, 2).font = small_gray
             row_i += 1
 
-    for i, w in enumerate([6, 55, 10, 14, 28, 22, 30], 1):
+    # ---------- подписи ----------
+    row_i += 1
+    ws.cell(row_i, 1, f"Составил: ____________________ (Ф.И.О.)")
+    ws.merge_cells(start_row=row_i, start_column=1, end_row=row_i, end_column=10)
+    row_i += 1
+    ws.cell(row_i, 1, f"Проверил: ____________________ (Ф.И.О.)")
+    ws.merge_cells(start_row=row_i, start_column=1, end_row=row_i, end_column=10)
+    row_i += 2
+    ws.cell(row_i, 1, (
+        f"Сформировано системой «Ревизор НТД» {datetime.utcnow().strftime('%d.%m.%Y %H:%M')} "
+        f"по разобранным строкам спецификации и кабельного журнала. "
+        f"Источники: {', '.join(sources) if sources else 'нет'}. "
+        f"Работы и нормы расхода, отсутствующие во входных данных, не добавлялись."
+    ))
+    ws.cell(row_i, 1).font = small_gray
+    ws.merge_cells(start_row=row_i, start_column=1, end_row=row_i, end_column=10)
+
+    # ---------- ширина колонок ----------
+    for i, w in enumerate([5, 34, 8, 10, 7, 52, 8, 10, 12, 34], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     wb.save(path)
