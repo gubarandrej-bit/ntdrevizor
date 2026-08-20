@@ -395,8 +395,11 @@ def _fuzzy_in(key: str, mapping: dict) -> bool:
 
 # ---------- схемы ↔ спецификация ----------
 
+# Двухбуквенные обозначения по ГОСТ 2.702/2.710 — реальные устройства.
+# Одиночные буквы (A, D, K, U, B…) не включаем: это метки цепей/выводов
+# и перевёрнутый текст, они дают ложные «не найдено в спецификации».
 EQUIP_TOKEN_RE = re.compile(
-    r"\b(?:QF|QS|QA|KM|KK|HL|EL|XS|XT|SG|BK|SA|SB|FU|TV|TA|CT|PT|PA|PV|WH|A|D|K|Y|B|C|G|U|W)"
+    r"\b(?:QF|QS|QA|KM|KK|HL|EL|XS|XT|SG|BK|SA|SB|FU|TV|TA|CT|PT|PA|PV|WH)"
     r"\s*-?\s*\d+[A-Za-zА-Яа-я0-9.\-]*\b"
 )
 
@@ -448,7 +451,7 @@ def check_scheme_vs_spec(spec_items: list[dict], scheme_files: list[dict]) -> di
         show = unmatched[:40]
         findings.append(
             finding(
-                "noncritical" if len(unmatched) < 8 else "critical",
+                "critical" if len(unmatched) > 40 else "noncritical",
                 "Обозначения на схемах не найдены в спецификации",
                 "Следующие позиционные обозначения извлечены со схем и не сопоставлены со спецификацией: "
                 + ", ".join(show)
@@ -491,7 +494,13 @@ def check_plan_lengths(journal: list[dict], plan_files: list[dict], tol_pct: flo
             # если есть любые полилинии — берём, но пометим
             lens = ext.get("lengths") or []
             if not lens:
-                errors.append(f"{f.get('filename')}: в чертеже нет измеримых линий/полилиний.")
+                if ext.get("kind") == "pdf":
+                    errors.append(
+                        f"{f.get('filename')}: план в PDF — векторная графика без слоёв "
+                        f"кабельных трасс; длины не измеряются автоматически (нужен DXF/DWG)."
+                    )
+                else:
+                    errors.append(f"{f.get('filename')}: в чертеже нет измеримых линий/полилиний.")
                 continue
         usable.append((f, lens))
 

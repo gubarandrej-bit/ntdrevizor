@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -134,6 +135,22 @@ def _run(db: Session, audit: Audit, talk: Callable) -> None:
     ]
     plan_files = [p for p in parsed if p["classified_as"] == "plan"]
     calc_files = [p for p in parsed if p["classified_as"] == "calculation"]
+
+    # Схемы и планы могут быть разделами объединённого PDF/DOC (такой файл
+    # классифицируется как specification). Распознаём их по маркерам в тексте
+    # страниц и передаём в соответствующие проверки «нарезанный» текст.
+    if not scheme_files:
+        scheme_files = [
+            {**p, "classified_as": "scheme", "extracted": _slice_pages(p.get("extracted") or {}, _SCHEME_PAGE_MARKERS)}
+            for p in parsed
+            if _text_has_any((p.get("extracted") or {}).get("text") or "", _SCHEME_PAGE_MARKERS)
+        ]
+    if not plan_files:
+        plan_files = [
+            {**p, "classified_as": "plan", "extracted": _slice_pages(p.get("extracted") or {}, _PLAN_PAGE_MARKERS)}
+            for p in parsed
+            if _text_has_any((p.get("extracted") or {}).get("text") or "", _PLAN_PAGE_MARKERS)
+        ]
 
     spec_items = all_items(spec_files) or all_items(
         [p for p in parsed if p["classified_as"] == "unknown"], "items"
@@ -481,6 +498,43 @@ def _check_catalog() -> dict:
 def _setting(db: Session, key: str, default: str) -> str:
     row = db.get(Setting, key)
     return row.value if row else default
+
+
+_SCHEME_PAGE_MARKERS = (
+    "схема структурн", "схема электрич", "схема принципиальн",
+    "схема функциональн", "схема подключен",
+)
+_PLAN_PAGE_MARKERS = (
+    "план расположен", "план прокладк", "план трасс",
+)
+
+
+def _text_has_any(text: str, markers: tuple[str, ...]) -> bool:
+    low = (text or "").lower()
+    return any(m in low for m in markers)
+
+
+def _slice_pages(extracted: dict, markers: tuple[str, ...]) -> dict:
+    """Оставляет в extracted только текст страниц, содержащих маркеры.
+
+    Используется, когда схема/план — раздел объединённого PDF/DOC: проверкам
+    передаётся текст именно этих страниц, а не всего документа (иначе
+    спецификация «подтверждала бы» сама себя).
+    """
+    data = dict(extracted)
+    text = data.get("text") or ""
+    parts = [
+        block for block in re.split(r"(?=--- страница \d+ ---\n)", text)
+        if _text_has_any(block, markers)
+    ]
+    data["text"] = "\n".join(parts).strip()
+    data["tables"] = []
+    data["items"] = []
+    data["cables"] = []
+    data["equipment"] = []
+    data["lengths"] = []
+    data["texts_geom"] = []
+    return data
 
 
 def _light_extracted(extracted: dict) -> dict:
