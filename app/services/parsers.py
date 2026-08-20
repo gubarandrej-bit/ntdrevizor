@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import re
 import shutil
@@ -19,6 +20,22 @@ from app.util import (
 
 MAX_TEXT = 200_000
 MAX_ROWS = 8_000
+
+
+def _quiet_pypdf() -> None:
+    """Глушим предупреждения pypdf о битых числах в PDF.
+
+    В некоторых PDF (экспорт из CAD) координаты текста склеиваются в строки вида
+    «779.045628.445» (две десятичные точки). pypdf не может преобразовать их в
+    число и пишет «could not convert string to float … use 0.0 instead» в лог.
+    Это не ошибка извлечения: текст читается, координаты подставляются нулевыми.
+    Чтобы не засорять журнал сервера сотнями строк — уровень логгера pypdf
+    поднимаем до ERROR.
+    """
+    try:
+        logging.getLogger("pypdf").setLevel(logging.ERROR)
+    except Exception:
+        pass
 
 
 def parse_file(path: Path) -> dict[str, Any]:
@@ -358,6 +375,8 @@ def _extract_tables_bounded(page: Any, timeout: float) -> list:
 
 def parse_pdf(path: Path) -> dict[str, Any]:
     from app.config import settings
+
+    _quiet_pypdf()
 
     text_parts: list[str] = []
     tables: list[dict[str, Any]] = []
