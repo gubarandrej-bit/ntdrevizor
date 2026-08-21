@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import Audit, AuditFile, CheckResult, Finding, Setting
-from app.util import loads, looks_like_cable, norm
+from app.util import loads, looks_like_cable, norm, parse_section
 
 
 def build_reports(db: Session, audit: Audit) -> dict[str, str]:
@@ -564,23 +564,62 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
         row_i += 1
 
     def _materials_under(materials: list[dict]) -> None:
-        """Перечень материалов под строкой вида работ (нумерация заново)."""
+        """Перечень материалов под строкой вида работ.
+
+        Одинаковые материалы агрегируются одной строкой:
+          — кабели — по марке (длины суммируются), с сечением;
+          — прочие — по (наименование, марка), количества суммируются.
+        Пример: «Монтаж кабеля» → Кабель ВВГнг(А)-LS 3x2.5 — 500 м;
+        Стяжки нейлоновые — 1 упак.; Гофротруба ПВХ — 500 м.
+        """
+        from collections import OrderedDict
+
         nonlocal row_i
-        mn = 0
+        groups: "OrderedDict[tuple, dict]" = OrderedDict()
         for it in materials:
             name = _name(it)
             mark = _mark(it)
             qty = it.get("qty") if it.get("qty") is not None else it.get("length")
-            unit = it.get("unit") or ("м" if it.get("length") is not None and it.get("qty") is None else "шт")
-            mat_text = name
-            if mark and mark.lower() not in name.lower():
-                mat_text = f"{name} — {mark}"
-            note = it.get("note") or ""
-            h = _height_of(it)
-            if h is not None:
-                note = (note + "; " if note else "") + f"высота {_band_of(h)}"
+            if qty is None:
+                continue
+            qty = float(qty)
+            if _is_cable(it):
+                brand = mark if (mark and looks_like_cable(mark)) else name
+                brand = re.sub(r"\s+", " ", brand).strip()
+                parsed = parse_section(" ".join(str(it.get(k) or "") for k in ("mark", "manufacturer", "name", "type")))
+                sec = ""
+                if parsed and parsed.get("mm2"):
+                    cores = parsed.get("cores")
+                    mm2 = parsed["mm2"]
+                    sec = f"{cores}x{('%g' % mm2)}" if cores else ('%g' % mm2)
+                # убираем из марки только токены сечения («1x2x0,75», «3х2,5»),
+                # не трогая «Cat5e»/«Cat6A»
+                base = re.sub(
+                    r"\d+(?:[.,]\d+)?(?:\s*[xх]\s*\d+(?:[.,]\d+)?)+",
+                    " ",
+                    brand,
+                )
+                base = re.sub(r"\s+", " ", base).strip(" -–")
+                if not base:
+                    base = brand
+                key = ("cable", base.upper(), sec)
+                unit = "м"
+                kind_word = "Провод" if "провод" in name.lower() else "Кабель"
+                disp = f"{kind_word} {base}" + (f" {sec}" if sec else "")
+            else:
+                key = ("item", name, mark or "")
+                unit = it.get("unit") or "шт"
+                disp = name if not mark or mark.lower() in name.lower() else f"{name} — {mark}"
+            g = groups.setdefault(key, {"qty": 0.0, "unit": unit, "disp": disp, "note": ""})
+            g["qty"] += qty
+            if not g["note"] and it.get("note"):
+                g["note"] = str(it.get("note")).strip()
+        mn = 0
+        for g in groups.values():
             mn += 1
-            _material_row(f"{mn}.", mat_text, unit, qty, note)
+            q = g["qty"]
+            q_disp = int(q) if q == int(q) and abs(q) < 1e6 else round(q, 2)
+            _material_row(f"{mn}.", g["disp"], g["unit"], q_disp, g["note"])
 
     if not equip and not carrier and not cab_materials:
         ws.cell(row_i, 2, "Исходных данных для ведомости объёмов нет. Файл не выдумывался.")
