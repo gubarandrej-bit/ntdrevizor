@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime
 from pathlib import Path
@@ -12,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import Audit, AuditFile, CheckResult, Finding, Setting
-from app.util import loads, looks_like_cable, norm, parse_section
+from app.util import loads, looks_like_cable, norm
 
 
 def build_reports(db: Session, audit: Audit) -> dict[str, str]:
@@ -369,6 +370,65 @@ def _is_cable_aux(it: dict) -> bool:
     return any(norm(k) in blob for k in _CABLE_AUX_KEYS)
 
 
+# полный токен сечения: «3x2,5», «1x2x0,75», «4х1,5» и т.п.
+_SECTION_TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)?(?:\s*[xх]\s*\d+(?:[.,]\d+)?){1,2}")
+
+_TYPICAL_AUX_NOTE = "Типовой сопутствующий материал — количество уточнить по проекту."
+
+
+def _cable_section_raw(text: str) -> str:
+    """Полное обозначение сечения из строки («3x2,5», «1x2x0,75»)."""
+    if not text:
+        return ""
+    m = _SECTION_TOKEN_RE.search(text.replace(" ", ""))
+    if m:
+        return m.group(0).replace(",", ".")
+    return ""
+
+
+def _is_cable_item(it: dict) -> bool:
+    """Позиция — кабельное изделие (по марке/наименованию)."""
+    return looks_like_cable(" ".join(str(it.get(k) or "") for k in ("name", "mark", "type", "manufacturer")))
+
+
+def _typical_cable_aux(cab_materials: list[dict], carrier: list[dict]) -> list[tuple[str, str, float, str]]:
+    """Типовые сопутствующие материалы к монтажу кабеля (если их нет в спецификации).
+
+    Пример заказчика: «Монтаж кабеля» → кабель 500 м, стяжки нейлоновые — 1 уп.,
+    гофротруба — 500 м. Возвращает строки (наименование, ед., кол-во, примечание):
+      — стяжки нейлоновые: 1 уп. на каждые 500 м кабеля (минимум 1);
+      — гофротруба ПВХ: длиной равной суммарной длине кабеля, если кабель
+        прокладывается не в коробах/лотках.
+    Количества — типовые, помечаются как требующие уточнения.
+    """
+    total_m = 0.0
+    has_gofra = False
+    has_styazhki = False
+    for it in cab_materials:
+        blob = norm(" ".join(str(it.get(k) or "") for k in ("name", "mark", "type")))
+        if "гофр" in blob:
+            has_gofra = True
+        if "стяжк" in blob or "хомут" in blob:
+            has_styazhki = True
+        if _is_cable_item(it):
+            total_m += float(it.get("length") or it.get("qty") or 0)
+
+    carrier_blob = norm(" ".join(str(it.get("name") or "") for it in carrier))
+    in_tray = bool(carrier_blob) and any(
+        k in carrier_blob for k in ("короб", "лоток", "кабель-канал", "лестниц")
+    )
+
+    rows: list[tuple[str, str, float, str]] = []
+    if total_m <= 0:
+        return rows
+    if not has_gofra and not in_tray:
+        rows.append(("Гофротруба ПВХ", "м", round(total_m, 1), _TYPICAL_AUX_NOTE))
+    if not has_styazhki:
+        up = max(1.0, float(math.ceil(total_m / 500.0)))
+        rows.append(("Стяжки нейлоновые (хомут-стяжка)", "уп.", up, _TYPICAL_AUX_NOTE))
+    return rows
+
+
 def _write_bov(db: Session, audit: Audit, path: Path) -> None:
     """Ведомость объёмов работ (ВОР) по форме заказчика.
 
@@ -586,26 +646,18 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
             if _is_cable(it):
                 brand = mark if (mark and looks_like_cable(mark)) else name
                 brand = re.sub(r"\s+", " ", brand).strip()
-                parsed = parse_section(" ".join(str(it.get(k) or "") for k in ("mark", "manufacturer", "name", "type")))
-                sec = ""
-                if parsed and parsed.get("mm2"):
-                    cores = parsed.get("cores")
-                    mm2 = parsed["mm2"]
-                    sec = f"{cores}x{('%g' % mm2)}" if cores else ('%g' % mm2)
-                # убираем из марки только токены сечения («1x2x0,75», «3х2,5»),
-                # не трогая «Cat5e»/«Cat6A»
-                base = re.sub(
-                    r"\d+(?:[.,]\d+)?(?:\s*[xх]\s*\d+(?:[.,]\d+)?)+",
-                    " ",
-                    brand,
-                )
+                # полное обозначение сечения ищем по всем полям записи
+                all_blob = " ".join(str(it.get(k) or "") for k in ("mark", "manufacturer", "name", "type"))
+                raw_sec = _cable_section_raw(all_blob)
+                # из марки убираем токен сечения («3x2,5», «1x2x0,75»), не трогая Cat5e/6A
+                base = _SECTION_TOKEN_RE.sub(" ", brand)
                 base = re.sub(r"\s+", " ", base).strip(" -–")
                 if not base:
                     base = brand
-                key = ("cable", base.upper(), sec)
+                key = ("cable", base.upper(), raw_sec)
                 unit = "м"
                 kind_word = "Провод" if "провод" in name.lower() else "Кабель"
-                disp = f"{kind_word} {base}" + (f" {sec}" if sec else "")
+                disp = f"{kind_word} {base}" + (f" {raw_sec}" if raw_sec else "")
             else:
                 key = ("item", name, mark or "")
                 unit = it.get("unit") or "шт"
@@ -643,6 +695,10 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
         if cab_materials:
             _work_type_row("Монтаж кабеля")
             _materials_under(cab_materials)
+            # типовые сопутствующие материалы (стяжки, гофротруба) — если их
+            # нет в спецификации; помечаются как требующие уточнения
+            for aux_name, aux_unit, aux_qty, aux_note in _typical_cable_aux(cab_materials, carrier):
+                _material_row("т.", aux_name, aux_unit, aux_qty, aux_note)
 
         # 4) Пусконаладочные работы — по типам оборудования спецификации.
         #    Виды ПНР выведены из типов оборудования; количества требуют
@@ -689,7 +745,8 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
         f"Источники: {', '.join(sources) if sources else 'нет'}. "
         f"Структура: вид работ → перечень материалов этой работы. "
         f"Кабельный журнал в ведомость не включается. "
-        f"Работы и нормы расхода, отсутствующие во входных данных, не добавлялись."
+        f"Строки «т.» — типовые сопутствующие материалы (стяжки, гофротруба), "
+        f"добавленные по нормам расхода и требующие уточнения по проекту."
     ))
     ws.cell(row_i, 1).font = small_gray
     ws.merge_cells(start_row=row_i, start_column=1, end_row=row_i, end_column=10)
