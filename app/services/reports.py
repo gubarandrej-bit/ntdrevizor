@@ -293,8 +293,15 @@ LAYING_ORDER = [
 ]
 
 _CABLE_CARRIER_KEYS = (
-    "лоток", "короб", "кабель-канал", "кабель канал", "гофр", "лестниц",
+    "лоток", "короб", "кабель-канал", "кабель канал", "лестниц",
     "консоль", "кронштейн", "профил", "перфорир", "упмк", "держатель", "хому",
+    "саморез", "дюбел", "анкер", "болт", "гайк", "винт", "шуруп", "метиз",
+)
+
+_CABLE_AUX_KEYS = (
+    "гофр", "металлорукав", "рукав",
+    "стяжк", "хомут", "клипс", "бирк", "наконечник",
+    "проходк", "маркиров", "этикетк",
 )
 
 
@@ -346,11 +353,20 @@ def _is_cable_carrier(it: dict) -> bool:
         return False
     if "термоусаж" in blob or "термоусад" in blob or "патруб" in blob:
         return False
-    if any(k in blob for k in _CABLE_CARRIER_KEYS):
+    if any(norm(k) in blob for k in _CABLE_CARRIER_KEYS):
         return True
     if "труб" in blob:
         return True
     return False
+
+
+def _is_cable_aux(it: dict) -> bool:
+    """Материалы, сопутствующие прокладке кабеля (идут в «Монтаж кабеля»):
+    гофротруба/металлорукав, стяжки, хомуты, клипсы, проходки, бирки, наконечники."""
+    blob = norm(" ".join(str(it.get(k) or "") for k in ("name", "mark", "type")))
+    if not blob:
+        return False
+    return any(norm(k) in blob for k in _CABLE_AUX_KEYS)
 
 
 def _write_bov(db: Session, audit: Audit, path: Path) -> None:
@@ -395,18 +411,20 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
         """
         return it.get("qty") is not None
 
-    # разбивка строк спецификации (только материальные — с количеством/длиной;
-    # строки оглавления «Общие данные», «План расположения…» не имеют количества)
+    # разбивка строк спецификации по видам работ:
+    #   equip      → «Монтаж оборудования» (приборы, извещатели, блоки и т.п.)
+    #   carrier    → «Монтаж кабеленесущих систем» (лотки, короба, трубы, крепёж)
+    #   cab_materials → «Монтаж кабеля» (кабели + гофра/стяжки/хомуты/проходки)
     equip: list[dict] = []
     carrier: list[dict] = []
-    cab_spec: list[dict] = []
+    cab_materials: list[dict] = []
     for it in items:
         if not _name(it):
             continue
         if not _is_spec_position(it):
             continue
-        if _is_cable(it):
-            cab_spec.append(it)
+        if _is_cable(it) or _is_cable_aux(it):
+            cab_materials.append(it)
         elif _is_cable_carrier(it):
             carrier.append(it)
         else:
@@ -508,85 +526,84 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
             ws.cell(row_i, col).fill = sub_fill
         row_i += 1
 
-    def _work_row(name: str, unit: str, qty, source: str, note: str = ""):
+    def _work_type_row(title: str) -> None:
+        """Строка вида работ («Монтаж кабеля», «Монтаж оборудования»…)."""
+        nonlocal row_i, n
+        ws.cell(row_i, 1, n).alignment = center
+        ws.cell(row_i, 2, title).font = Font(bold=True)
+        ws.cell(row_i, 2).alignment = wrap
+        for col in range(1, 11):
+            ws.cell(row_i, col).border = border
+            ws.cell(row_i, col).fill = sub_fill
+        row_i += 1
+        n += 1
+
+    def _work_row(name: str, unit: str, qty, note: str = ""):
+        """Строка работы с единицей и объёмом (используется для ПНР)."""
         nonlocal row_i, n
         ws.cell(row_i, 1, n).alignment = center
         ws.cell(row_i, 2, name).alignment = wrap
         ws.cell(row_i, 3, unit).alignment = center
         ws.cell(row_i, 4, qty if qty is not None else "").alignment = center
-        note_full = source
-        if note:
-            note_full += "; " + note
-        ws.cell(row_i, 10, note_full).alignment = wrap
+        ws.cell(row_i, 10, note).alignment = wrap
         for col in range(1, 11):
             ws.cell(row_i, col).border = border
         row_i += 1
         n += 1
 
-    def _material_row(mat_no: str, mark: str, unit: str, qty, source: str, note: str = ""):
+    def _material_row(mat_no: str, name: str, unit: str, qty, note: str = ""):
         nonlocal row_i
         ws.cell(row_i, 5, mat_no).alignment = center
-        ws.cell(row_i, 6, mark).alignment = wrap
+        ws.cell(row_i, 6, name).alignment = wrap
         ws.cell(row_i, 7, unit).alignment = center
         ws.cell(row_i, 8, qty if qty is not None else "").alignment = center
         ws.cell(row_i, 9, "").alignment = center
-        note_full = source
-        if note:
-            note_full += "; " + note
-        ws.cell(row_i, 10, note_full).alignment = wrap
+        ws.cell(row_i, 10, note).alignment = wrap
         for col in range(1, 11):
             ws.cell(row_i, col).border = border
         row_i += 1
 
-    def _work_with_material(it: dict, verb: str, source: str, mat_counter: list) -> None:
-        """Работа (монтаж/прокладка) + под ней строка материала из спецификации."""
-        name = _name(it)
-        mark = _mark(it)
-        if mark and mark.lower() in name.lower():
-            mark = ""  # марка уже в названии — не дублируем
-        qty = it.get("qty") if it.get("qty") is not None else it.get("length")
-        unit = it.get("unit") or ("м" if it.get("length") is not None and it.get("qty") is None else "шт")
-        low = name.lower()
-        if low.startswith(("монтаж", "укладк", "прокладк", "установк", "затяжк")):
-            work = name
-        else:
-            work = f"{verb}: {name}"
-        _work_row(work, unit, qty, source, it.get("note") or "")
-        # материал — это сама позиция спецификации (марка/артикул)
-        mat_counter[0] += 1
-        mat_text = mark if mark else name
-        _material_row(f"{mat_counter[0]}.", mat_text, unit, qty, source)
-
-    def _material_rows(materials: list[dict], verb: str, source: str) -> None:
+    def _materials_under(materials: list[dict]) -> None:
+        """Перечень материалов под строкой вида работ (нумерация заново)."""
         nonlocal row_i
-        mc = [0]
+        mn = 0
         for it in materials:
-            _work_with_material(it, verb, source, mc)
+            name = _name(it)
+            mark = _mark(it)
+            qty = it.get("qty") if it.get("qty") is not None else it.get("length")
+            unit = it.get("unit") or ("м" if it.get("length") is not None and it.get("qty") is None else "шт")
+            mat_text = name
+            if mark and mark.lower() not in name.lower():
+                mat_text = f"{name} — {mark}"
+            note = it.get("note") or ""
+            h = _height_of(it)
+            if h is not None:
+                note = (note + "; " if note else "") + f"высота {_band_of(h)}"
+            mn += 1
+            _material_row(f"{mn}.", mat_text, unit, qty, note)
 
-    if not equip and not carrier and not cab_spec:
+    if not equip and not carrier and not cab_materials:
         ws.cell(row_i, 2, "Исходных данных для ведомости объёмов нет. Файл не выдумывался.")
         ws.merge_cells(start_row=row_i, start_column=2, end_row=row_i, end_column=10)
         row_i += 1
     else:
-        # 1) Оборудование и материалы — позиции спецификации (не кабель, не кабеленесущие)
+        # Структура: сначала вид работ, затем перечень всех материалов этой работы
+        # (по требованию заказчика). Только позиции спецификации; журнал не входит.
+
+        # 1) Монтаж оборудования
         if equip:
-            _section("Оборудование и материалы")
-            _material_rows(equip, "Установка", "спецификация")
+            _work_type_row("Монтаж оборудования")
+            _materials_under(equip)
 
-        # 2) Кабельные изделия и провода (поставка из спецификации)
-        if cab_spec:
-            _section("Кабельные изделия и провода")
-            _material_rows(cab_spec, "Прокладка", "спецификация")
-
-        # 3) Монтаж кабеленесущих систем — по высотным отметкам (работа → материалы)
+        # 2) Монтаж кабеленесущих систем
         if carrier:
-            _section("Монтаж кабеленесущих систем")
-            for band in HEIGHT_BAND_ORDER:
-                band_items = [i for i in carrier if _band_of(_height_of(i)) == band]
-                if not band_items:
-                    continue
-                _sub(f"— высота: {band}")
-                _material_rows(band_items, "Монтаж", "спецификация")
+            _work_type_row("Монтаж кабеленесущих систем")
+            _materials_under(carrier)
+
+        # 3) Монтаж кабеля (кабель + гофра/стяжки/хомуты/проходки)
+        if cab_materials:
+            _work_type_row("Монтаж кабеля")
+            _materials_under(cab_materials)
 
         # 4) Пусконаладочные работы — по типам оборудования спецификации.
         #    Виды ПНР выведены из типов оборудования; количества требуют
@@ -615,7 +632,7 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
             pnr_lines.append(("Настройка программного обеспечения верхнего уровня", "компл", str(n_sw)))
         pnr_lines.append(("Проверка работоспособности системы, протокол испытаний", "компл", "1"))
         if pnr_lines:
-            _section("Пусконаладочные работы")
+            _work_type_row("Пусконаладочные работы")
             for name, unit, qty in pnr_lines:
                 _work_row(name, unit, qty, "выведено из спецификации")
 
@@ -631,9 +648,9 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
         f"Сформировано системой «Ревизор НТД» {datetime.utcnow().strftime('%d.%m.%Y %H:%M')} "
         f"по позициям спецификации оборудования, изделий и материалов. "
         f"Источники: {', '.join(sources) if sources else 'нет'}. "
-        f"Все позиции спецификации с количеством/длиной включены в ведомость. "
-        f"Высота монтажа и способ прокладки берутся из примечаний/колонок входных данных; "
-        f"если не указаны — строка помечена «не указано». Работы и нормы расхода не добавлялись."
+        f"Структура: вид работ → перечень материалов этой работы. "
+        f"Кабельный журнал в ведомость не включается. "
+        f"Работы и нормы расхода, отсутствующие во входных данных, не добавлялись."
     ))
     ws.cell(row_i, 1).font = small_gray
     ws.merge_cells(start_row=row_i, start_column=1, end_row=row_i, end_column=10)
