@@ -370,19 +370,21 @@ def _is_cable_aux(it: dict) -> bool:
     return any(norm(k) in blob for k in _CABLE_AUX_KEYS)
 
 
-# полный токен сечения: «3x2,5», «1x2x0,75», «4х1,5» и т.п.
-_SECTION_TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)?(?:\s*[xх]\s*\d+(?:[.,]\d+)?){1,2}")
+# полный токен сечения: «3x2,5», «1x2x0,75», «4х1,5», «3*1,5» и т.п.
+_SECTION_TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)?(?:\s*[xх×*]\s*\d+(?:[.,]\d+)?){1,2}")
 
 _TYPICAL_AUX_NOTE = "Типовой сопутствующий материал — количество уточнить по проекту."
 
 
 def _cable_section_raw(text: str) -> str:
-    """Полное обозначение сечения из строки («3x2,5», «1x2x0,75»)."""
+    """Полное обозначение сечения из строки («3x2,5», «1x2x0,75», «3*1,5»)."""
     if not text:
         return ""
     m = _SECTION_TOKEN_RE.search(text.replace(" ", ""))
     if m:
-        return m.group(0).replace(",", ".")
+        tok = m.group(0)
+        tok = tok.replace("х", "x").replace("×", "x").replace("*", "x").replace(",", ".")
+        return tok
     return ""
 
 
@@ -421,11 +423,11 @@ def _typical_cable_aux(cab_materials: list[dict], carrier: list[dict]) -> list[t
     rows: list[tuple[str, str, float, str]] = []
     if total_m <= 0:
         return rows
-    if not has_gofra and not in_tray:
-        rows.append(("Гофротруба ПВХ", "м", round(total_m, 1), _TYPICAL_AUX_NOTE))
     if not has_styazhki:
         up = max(1.0, float(math.ceil(total_m / 500.0)))
         rows.append(("Стяжки нейлоновые (хомут-стяжка)", "уп.", up, _TYPICAL_AUX_NOTE))
+    if not has_gofra and not in_tray:
+        rows.append(("Гофротруба ПВХ", "м", round(total_m, 1), _TYPICAL_AUX_NOTE))
     return rows
 
 
