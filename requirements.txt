@@ -13,3 +13,4 @@ pypdf==5.1.0
 ezdxf==1.3.5
 rapidfuzz==3.11.0
 python-dateutil==2.9.0.post0
+pymupdf

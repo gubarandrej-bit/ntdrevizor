@@ -125,6 +125,212 @@ def _extract_pdf_text_subprocess(path: Path, budget: float, page_timeout: float)
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _text_is_garbled(text: str) -> bool:
+    """Определяет «битый» посимвольный текст (экспорт из CAD/XPS).
+
+    В таких PDF каждый символ — отдельный текстовый объект, и extract_text
+    возвращает «И\\nн\\nв\\n.\\n...» (почти каждая строка длиной 1–2 символа).
+    Для нормального текста доля коротких строк низкая.
+    """
+    if not text:
+        return True
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 40:
+        return False
+    short = sum(1 for ln in lines if len(ln.strip()) <= 2)
+    return short / len(lines) > 0.6
+
+
+_PDFPLUMBER_TEXT_WORKER = r"""
+import json, sys, threading
+import pdfplumber
+
+def main():
+    path, out, page_timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])
+    f = open(out, "w", encoding="utf-8")
+    with pdfplumber.open(path) as pdf:
+        for i, page in enumerate(pdf.pages[:80]):
+            box = {"done": False, "text": ""}
+            def job():
+                try:
+                    box["text"] = page.extract_text() or ""
+                except Exception:
+                    box["text"] = ""
+                finally:
+                    box["done"] = True
+            t = threading.Thread(target=job, daemon=True)
+            t.start()
+            t.join(page_timeout)
+            if box["done"] and box["text"].strip():
+                f.write(json.dumps([i + 1, box["text"]]) + "\n")
+                f.flush()
+    f.close()
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+_PYMUPDF_TEXT_WORKER = r"""
+import json, sys
+import pymupdf
+
+def main():
+    path, out = sys.argv[1], sys.argv[2]
+    doc = pymupdf.open(path)
+    f = open(out, "w", encoding="utf-8")
+    for i, page in enumerate(doc):
+        if i >= 80:
+            break
+        try:
+            t = page.get_text()
+        except Exception:
+            t = ""
+        if t.strip():
+            f.write(json.dumps([i + 1, t]) + "\n")
+            f.flush()
+    doc.close()
+    f.close()
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def _extract_pymupdf_text_subprocess(path: Path, budget: float) -> tuple[list[str] | None, list[str]]:
+    """Извлекает текст через PyMuPDF — быстро и корректно для PDF из CAD/XPS.
+
+    Возвращает (None, notes), если пакет не установлен."""
+    try:
+        import pymupdf  # noqa: F401
+    except ImportError:
+        return None, ["PyMuPDF не установлен (pip install pymupdf)."]
+    tmp = Path(tempfile.mkdtemp(prefix="pymupdf_"))
+    worker = tmp / "worker.py"
+    out = tmp / "out.jsonl"
+    notes: list[str] = []
+    try:
+        worker.write_text(_PYMUPDF_TEXT_WORKER, encoding="utf-8")
+        proc = subprocess.Popen(
+            [str(sys.executable), str(worker), str(path), str(out)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            proc.wait(timeout=budget)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            notes.append(f"Бюджет {budget:g}с на PyMuPDF исчерпан.")
+        parts: list[str] = []
+        if out.exists():
+            for line in out.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    pn, text = json.loads(line)
+                    if str(text).strip():
+                        parts.append(f"--- страница {pn} ---\n{text}")
+                except Exception:
+                    continue
+        return parts, notes
+    except Exception as exc:
+        notes.append(f"pymupdf-text-subprocess: {exc}")
+        return None, notes
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _extract_text_pdftotext(path: Path, budget: float) -> tuple[list[str] | None, list[str]]:
+    """Извлекает текст через pdftotext (poppler) — самый быстрый и корректный
+    способ для PDF, экспортированных из CAD/XPS. Возвращает (None, notes), если
+    утилита не установлена."""
+    exe = shutil.which("pdftotext")
+    if not exe:
+        return None, ["pdftotext не установлен (пакет poppler-utils)."]
+    tmp = Path(tempfile.mkdtemp(prefix="pdftotext_"))
+    out = tmp / "out.txt"
+    notes: list[str] = []
+    try:
+        proc = subprocess.Popen(
+            [exe, "-layout", str(path), str(out)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            proc.wait(timeout=budget)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            notes.append(f"Бюджет {budget:g}с на pdftotext исчерпан.")
+        parts: list[str] = []
+        if out.exists():
+            text = out.read_text(encoding="utf-8", errors="replace")
+            for i, pg in enumerate(text.split("\f")):
+                if pg.strip():
+                    parts.append(f"--- страница {i + 1} ---\n{pg}")
+        return parts, notes
+    except Exception as exc:
+        notes.append(f"pdftotext: {exc}")
+        return None, notes
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _extract_pdfplumber_text_subprocess(path: Path, budget: float, page_timeout: float) -> tuple[list[str], list[str]]:
+    """Извлекает текст страниц PDF через pdfplumber в отдельном процессе.
+
+    pdfplumber корректно собирает слова в PDF, экспортированных из CAD/XPS
+    (где pypdf даёт посимвольный текст). Бюджет и постраничный тайм-аут — как
+    у pypdf-варианта.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="pdftext_pp_"))
+    worker = tmp / "worker.py"
+    out = tmp / "out.jsonl"
+    notes: list[str] = []
+    try:
+        worker.write_text(_PDFPLUMBER_TEXT_WORKER, encoding="utf-8")
+        proc = subprocess.Popen(
+            [str(sys.executable), str(worker), str(path), str(out), f"{page_timeout}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            proc.wait(timeout=budget)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            notes.append(f"Бюджет {budget:g}с на текст PDF (pdfplumber) исчерпан — часть страниц пропущена.")
+        parts: list[str] = []
+        if out.exists():
+            for line in out.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    pn, text = json.loads(line)
+                    if str(text).strip():
+                        parts.append(f"--- страница {pn} ---\n{text}")
+                except Exception:
+                    continue
+        return parts, notes
+    except Exception as exc:
+        notes.append(f"pdfplumber-text-subprocess: {exc}")
+        return [], notes
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def parse_file(path: Path) -> dict[str, Any]:
     ext = path.suffix.lower()
     if ext in {".xls", ".xlsx", ".xlsm"}:
@@ -437,6 +643,143 @@ def _extract_plan_lengths(
     return lengths, notes
 
 
+# Только достаточно специфичные токены марок: короткие («ксп», «пвс», «нрг»…)
+# срабатывают внутри обычных слов («эКСПлуатации») и дают ложные записи.
+_JOURNAL_MARK_TOKENS = (
+    "вббшв", "квббшв", "ввг", "кввг", "кгввг", "пугв", "шввп",
+    "кспв", "кспэ", "ксвв", "ксбг", "ксбк",
+    "тпп", "мкэш", "сип", "аввг",
+    "frls", "frhf", "ftp", "utp", "nmf",
+)
+
+
+def _journal_line_to_item(line: str) -> dict[str, Any] | None:
+    """Строка кабельного журнала из CAD-экспорта → запись (марка + длина).
+
+    В PDF, экспортированных из CAD/XPS, таблица кабельного журнала не
+    детектируется по колонкам, но текст строк содержит «… МАРКА СЕЧЕНИЕ ДЛИНА»:
+    например «Е-1-7 XD1.1 XD1.2 11 2 ВВГнг(А)-LS 3х2,5 13» → марка ВВГнг(А)-LS,
+    длина 13 м. Длина — последнее число строки; марка — токен с известным
+    признаком кабельной продукции.
+    """
+    t = re.sub(r"\s+", " ", line).strip()
+    if len(t) < 8:
+        return None
+    nums = re.findall(r"\d+(?:[.,]\d+)?", t)
+    if not nums:
+        return None
+    length = parse_float(nums[-1])
+    if length is None:
+        return None
+    low = t.lower()
+    mark = None
+    best_i = -1
+    for tok in _JOURNAL_MARK_TOKENS:
+        i = low.find(tok)
+        if i < 0:
+            continue
+        m = re.search(r"[A-Za-zА-Яа-я0-9\-/.]*" + re.escape(tok) + r"[A-Za-zА-Яа-я0-9\-/.]*", t, re.I)
+        if m and i > best_i:
+            best_i = i
+            mark = m.group(0)
+    if not mark:
+        return None
+    return {
+        "name": mark,
+        "mark": mark,
+        "type": "",
+        "length": length,
+        "qty": None,
+        "from": "",
+        "to": "",
+        "sheet": "journal_text",
+    }
+
+
+def _words_to_lines(words: list, y_tol: float = 4.0) -> list[str]:
+    """Группирует слова (x0,y0,x1,y1,word,...) в визуальные строки по y-координате.
+
+    Нужно для кабельных журналов в CAD-экспортах: марка кабеля и длина находятся
+    в одной визуальной строке, но разными текстовыми объектами, и get_text()
+    выводит их на разных «строках» вывода.
+    """
+    words = sorted(words, key=lambda w: (w[1], w[0]))
+    lines: list[list] = []
+    cur: list = []
+    cur_y: float | None = None
+    for w in words:
+        if cur_y is None or abs(w[1] - cur_y) <= y_tol:
+            cur.append(w)
+            if cur_y is None:
+                cur_y = w[1]
+        else:
+            lines.append(cur)
+            cur = [w]
+            cur_y = w[1]
+    if cur:
+        lines.append(cur)
+    out: list[str] = []
+    for ln in lines:
+        ln.sort(key=lambda w: w[0])
+        out.append(" ".join(str(w[4]) for w in ln))
+    return out
+
+
+def _parse_journal_lines_pymupdf(path: Path, page_texts: dict[int, str]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Разбор кабельного журнала через координаты слов PyMuPDF.
+
+    Для страниц с заголовком «Кабельный журнал» собирает визуальные строки
+    (слова, выровненные по y) и распознаёт «… МАРКА … ДЛИНА» в каждой.
+    """
+    try:
+        import pymupdf
+    except ImportError:
+        return [], ["PyMuPDF не установлен — журнал из текста не разобран."]
+    journal: list[dict[str, Any]] = []
+    notes: list[str] = []
+    doc = pymupdf.open(str(path))
+    try:
+        for pn, ptext in page_texts.items():
+            if "кабельный журнал" not in ptext.lower():
+                continue
+            if pn < 1 or pn > len(doc):
+                continue
+            words = doc[pn - 1].get_text("words")
+            lines = _words_to_lines(words)
+            hits = 0
+            for ln in lines:
+                it = _journal_line_to_item(ln)
+                if it:
+                    it["sheet"] = f"p{pn}_journal"
+                    journal.append(it)
+                    hits += 1
+            if hits:
+                notes.append(f"Кабельный журнал (стр. {pn}): {hits} строк распознано.")
+    finally:
+        doc.close()
+    return journal, notes
+
+
+def _parse_journal_lines(page_texts: dict[int, str]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Разбирает строки кабельного журнала из текста страниц с заголовком журнала."""
+    journal: list[dict[str, Any]] = []
+    notes: list[str] = []
+    for pn, ptext in page_texts.items():
+        low = ptext.lower()
+        if "кабельный журнал" not in low:
+            continue
+        hits = 0
+        for line in ptext.splitlines():
+            it = _journal_line_to_item(line)
+            if it:
+                it["sheet"] = f"p{pn}_journal"
+                journal.append(it)
+                hits += 1
+        if hits:
+            notes.append(f"Кабельный журнал (стр. {pn}): {hits} строк распознано из текста.")
+    return journal, notes
+
+
 def _extract_tables_bounded(page: Any, timeout: float) -> list:
     """extract_tables() с жёстким тайм-аутом.
 
@@ -478,6 +821,26 @@ def parse_pdf(path: Path) -> dict[str, Any]:
     text_page_timeout = float(getattr(settings, "pdf_text_page_timeout", 2.5) or 2.5)
     text_parts, t_notes = _extract_pdf_text_subprocess(path, text_budget, text_page_timeout)
     notes.extend(t_notes)
+
+    # pypdf на PDF, экспортированных из CAD/XPS, может вернуть посимвольный
+    # текст («И\nн\nв\n. ...») — тогда слова не склеиваются и спецификация/
+    # журнал не распознаются. Переизвлекаем каскадом быстрых экстракторов:
+    # PyMuPDF → pdftotext (poppler) → pdfplumber.
+    if _text_is_garbled("\n".join(text_parts)) or not text_parts:
+        if _text_is_garbled("\n".join(text_parts)):
+            notes.append("Текст pypdf посимвольный (экспорт CAD/XPS) — переизвлечение.")
+        mupdf_parts, t_notes = _extract_pymupdf_text_subprocess(path, text_budget)
+        notes.extend(t_notes)
+        if mupdf_parts:
+            text_parts = mupdf_parts
+        else:
+            pdftotext_parts, t_notes = _extract_text_pdftotext(path, text_budget)
+            notes.extend(t_notes)
+            if pdftotext_parts:
+                text_parts = pdftotext_parts
+            else:
+                text_parts, t_notes = _extract_pdfplumber_text_subprocess(path, text_budget, text_page_timeout)
+                notes.extend(t_notes)
 
     if not text_parts:
         # запасной вариант: pdfplumber в потоке (если подпроцесс недоступен)
@@ -535,29 +898,32 @@ def parse_pdf(path: Path) -> dict[str, Any]:
 
             def _priority(pn: int) -> int:
                 low = page_texts.get(pn, "").lower()
-                # явные маркеры спецификации (ГОСТ 21.110) и кабельного журнала —
-                # самые важные и быстрые страницы
+                # 0 — явные маркеры спецификации (ГОСТ 21.110) и кабельного журнала.
+                #    «спецификац» ловит и обрыв строки «Спецификация оборудовани…»
+                #    в CAD-экспорте. Эти страницы разбираются первыми.
                 if any(
                     k in low
                     for k in (
-                        "спецификация оборудован",
-                        "спецификация издели",
+                        "спецификац",
                         "кабельный журнал",
                         "направление кабеля",
                         "потребность кабелей",
                     )
                 ):
                     return 0
+                # 1 — таблицы вида «Поз. | Наименование | Кол. | Примечание»
+                #    (перечни элементов, спецификации без явного заголовка)
                 if "поз." in low and "наименование" in low:
-                    return 0
-                if "наименование" in low and "кол." in low:
                     return 1
-                if any(k in low for k in ("наименование", "обозначение", "примечание", "марка", "длина")):
+                # 2 — прочие табличные страницы
+                if "наименование" in low and "кол." in low:
                     return 2
-                return 3  # планы/чертежи, где «кол.» — из штампа: пропускаем
+                if any(k in low for k in ("наименование", "обозначение", "примечание", "марка", "длина")):
+                    return 3
+                return 4  # планы/чертежи, где «кол.» — из штампа: пропускаем
 
             candidates = sorted(
-                [pn for pn in page_texts if _priority(pn) <= 2 and pn not in slow_pages],
+                [pn for pn in page_texts if _priority(pn) <= 3 and pn not in slow_pages],
                 key=lambda pn: (_priority(pn), pn),
             )
 
@@ -633,6 +999,15 @@ def parse_pdf(path: Path) -> dict[str, Any]:
         except Exception as exc:
             notes.append(f"pdf-geometry: {exc}")
 
+    # 4) Кабельный журнал (CAD-экспорт): extract_tables не детектирует колонки
+    #    журнала, но строки «… МАРКА … ДЛИНА» есть в тексте/координатах слов.
+    journal_items: list[dict[str, Any]] = []
+    journal_items, jn = _parse_journal_lines_pymupdf(path, page_texts)
+    notes.extend(jn)
+    if not journal_items:
+        journal_items, jn = _parse_journal_lines(page_texts)
+        notes.extend(jn)
+
     return _base(
         ok=True,
         kind="pdf",
@@ -641,6 +1016,7 @@ def parse_pdf(path: Path) -> dict[str, Any]:
         items=items,
         cables=cables,
         lengths=lengths,
+        journal=journal_items,
         notes="; ".join(notes),
     )
 
@@ -1020,6 +1396,7 @@ def _base(**kwargs) -> dict[str, Any]:
         "equipment": [],
         "lengths": [],
         "texts_geom": [],
+        "journal": [],
     }
     out.update(kwargs)
     if out.get("text"):
