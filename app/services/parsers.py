@@ -760,13 +760,32 @@ def _parse_journal_lines_pymupdf(path: Path, page_texts: dict[int, str]) -> tupl
                 continue
             words = doc[pn - 1].get_text("words")
             lines = _words_to_lines(words)
+            # Блок «Итого:» — сводные суммы по маркам (включая запас), которые
+            # соответствуют спецификации. Детальные строки трасс не включают
+            # запас, поэтому для сверки длин авторитетны именно итоги.
+            cut = len(lines)
+            for idx, ln in enumerate(lines):
+                if "итого" in ln.lower():
+                    cut = idx
+                    break
             hits = 0
-            for ln in lines:
+            for ln in lines[:cut]:
                 it = _journal_line_to_item(ln)
                 if it:
                     it["sheet"] = f"p{pn}_journal"
                     journal.append(it)
                     hits += 1
+            if cut < len(lines):
+                # разбираем сам блок «Итого» как итоговые значения по маркам
+                tot = 0
+                for ln in lines[cut:]:
+                    it = _journal_line_to_item(ln)
+                    if it:
+                        it["sheet"] = f"p{pn}_journal"
+                        it["is_total"] = True
+                        journal.append(it)
+                        tot += 1
+                notes.append(f"Кабельный журнал (стр. {pn}): {tot} итоговых значений (Итого).")
             if hits:
                 notes.append(f"Кабельный журнал (стр. {pn}): {hits} строк распознано.")
     finally:
@@ -784,6 +803,9 @@ def _parse_journal_lines(page_texts: dict[int, str]) -> tuple[list[dict[str, Any
             continue
         hits = 0
         for line in ptext.splitlines():
+            # блок «Итого:» — сводные суммы, дублирующие спецификацию
+            if "итого" in line.lower():
+                break
             it = _journal_line_to_item(line)
             if it:
                 it["sheet"] = f"p{pn}_journal"

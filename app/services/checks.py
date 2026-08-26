@@ -283,12 +283,25 @@ def check_spec_journal_qty(spec_items: list[dict], journal: list[dict], tol_pct:
 
     jour_sum: dict[str, float] = defaultdict(float)
     jour_has: dict[str, bool] = {}
+    # итоговые значения блока «Итого» (суммы по маркам с запасом) авторитетны
+    # для сравнения со спецификацией; детальные строки трасс — только если
+    # итогов нет (например, в объединённых PDF без блока «Итого»).
+    total_by_key: dict[str, float] = {}
+    for i in journal:
+        if i.get("is_total"):
+            key = _cable_key(i)
+            qty = i.get("length") if i.get("length") is not None else i.get("qty")
+            if qty is not None:
+                total_by_key[key] = float(qty)
     for i in journal:
         key = _cable_key(i)
         qty = i.get("length") if i.get("length") is not None else i.get("qty")
         jour_has[key] = jour_has.get(key, False) or qty is not None
         if qty is not None:
             jour_sum[key] += float(qty)
+    for key, val in total_by_key.items():
+        jour_sum[key] = val
+        jour_has[key] = True
 
     findings = []
     keys = set(spec_sum) | set(jour_sum) | set(spec_has) | set(jour_has)
