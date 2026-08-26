@@ -347,19 +347,28 @@ def _is_material_line(i: dict) -> bool:
 
 
 def _cable_brand(i: dict) -> str:
-    """Марка кабеля: предпочитаем заводскую марку, если она выглядит как кабель."""
-    for k in ("manufacturer", "mark", "type", "name"):
+    """Марка кабеля: предпочитаем заводскую марку, если она выглядит как кабель.
+
+    Если позиция — кабель по наименованию («Кабель …», «Провод …»), марка в поле
+    mark/manufacturer приоритетна даже если она не входит в список типовых марок
+    (например NMF-4XE… — волоконно-оптический кабель NIKOMAX).
+    """
+    name = str(i.get("name") or "").strip()
+    by_name = looks_like_cable(name)
+    for k in ("manufacturer", "mark", "type"):
         v = str(i.get(k) or "").strip()
-        if v and looks_like_cable(v):
+        if v and (looks_like_cable(v) or by_name):
             return v
     return str(i.get("mark") or i.get("name") or "").strip()
 
 
 def _strip_section_from_mark(mark: str) -> str:
-    """Убирает '3x2.5' / '3х2,5' из марки, чтобы журнал и спецификация сходились."""
+    """Убирает '3x2.5' / '3х2,5' и суффикс «ТУ …» из марки, чтобы журнал
+    и спецификация сходились."""
     t = compact_mark(mark)
     t = re.sub(r"\d+(?:[.,]\d+)?x\d+(?:[.,]\d+)?", "", t)
     t = re.sub(r"\d+(?:[.,]\d+)?мм2?", "", t)
+    t = re.sub(r"ту\d+[-.\w]*", "", t)
     return t
 
 
@@ -367,9 +376,14 @@ def _cable_key(i: dict) -> str:
     brand = _cable_brand(i)
     mark = _strip_section_from_mark(brand) if brand else ""
     name = _strip_section_from_mark(i.get("name") or "") if not brand else ""
-    parsed = i.get("section") or parse_section(
-        " ".join(str(i.get(k) or "") for k in ("mark", "manufacturer", "name", "type"))
-    )
+    # Сечение ищем в марке/производителе/типе. Наименование не подставляем в
+    # разбор сечения: номер позиции («7. Кабель …») склеивается с «3х2,5» после
+    # удаления пробелов и ломает разбор («3х2,57»).
+    parsed = i.get("section")
+    if not parsed:
+        parsed = parse_section(" ".join(str(i.get(k) or "") for k in ("mark", "manufacturer", "type")))
+    if not parsed:
+        parsed = parse_section(str(i.get("name") or ""))
     sec = ""
     if parsed and parsed.get("mm2"):
         cores = parsed.get("cores")

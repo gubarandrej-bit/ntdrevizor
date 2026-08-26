@@ -653,14 +653,17 @@ _JOURNAL_MARK_TOKENS = (
 )
 
 
+_SECTION_WORD_RE = re.compile(r"^\d+(?:[.,]\d+)?\s*[xх×*]\s*\d+(?:[.,]\d+)?$")
+
+
 def _journal_line_to_item(line: str) -> dict[str, Any] | None:
-    """Строка кабельного журнала из CAD-экспорта → запись (марка + длина).
+    """Строка кабельного журнала из CAD-экспорта → запись (марка + сечение + длина).
 
     В PDF, экспортированных из CAD/XPS, таблица кабельного журнала не
     детектируется по колонкам, но текст строк содержит «… МАРКА СЕЧЕНИЕ ДЛИНА»:
     например «Е-1-7 XD1.1 XD1.2 11 2 ВВГнг(А)-LS 3х2,5 13» → марка ВВГнг(А)-LS,
-    длина 13 м. Длина — последнее число строки; марка — токен с известным
-    признаком кабельной продукции.
+    сечение 3х2,5, длина 13 м. Марка — целое слово с признаком кабельной
+    продукции; сечение — следующее слово вида NxN; длина — последнее число.
     """
     t = re.sub(r"\s+", " ", line).strip()
     if len(t) < 8:
@@ -671,23 +674,34 @@ def _journal_line_to_item(line: str) -> dict[str, Any] | None:
     length = parse_float(nums[-1])
     if length is None:
         return None
-    low = t.lower()
+    words = t.split()
     mark = None
-    best_i = -1
-    for tok in _JOURNAL_MARK_TOKENS:
-        i = low.find(tok)
-        if i < 0:
-            continue
-        m = re.search(r"[A-Za-zА-Яа-я0-9\-/.]*" + re.escape(tok) + r"[A-Za-zА-Яа-я0-9\-/.]*", t, re.I)
-        if m and i > best_i:
-            best_i = i
-            mark = m.group(0)
+    for w in words:
+        wl = w.lower()
+        if any(tok in wl for tok in _JOURNAL_MARK_TOKENS):
+            mark = w
+            break
     if not mark:
         return None
+    sec_raw = ""
+    try:
+        mi = words.index(mark)
+        for w in words[mi + 1 : mi + 3]:
+            if _SECTION_WORD_RE.match(w):
+                sec_raw = w.replace(",", ".").replace("х", "x").replace("×", "x").replace("*", "x")
+                break
+    except ValueError:
+        pass
+    section = None
+    if sec_raw:
+        parsed = parse_section(sec_raw)
+        if parsed:
+            section = parsed
     return {
         "name": mark,
         "mark": mark,
         "type": "",
+        "section": section,
         "length": length,
         "qty": None,
         "from": "",
