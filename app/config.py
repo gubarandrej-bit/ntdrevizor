@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     # Разбор PDF: pdfplumber/pypdf на сложных «векторных» страницах могут
     # «виснуть» на десятки секунд. Лимиты ниже это пресекают.
     pdf_table_budget: float = 30.0        # общий бюджет на разбор таблиц, с
+    pdf_geometry_budget: float = 30.0     # бюджет на измерение трасс планов, с
     pdf_table_page_timeout: float = 6.0   # тайм-аут таблиц на одну страницу, с
     pdf_text_budget: float = 120.0         # общий бюджет на извлечение текста PDF, с
     pdf_text_page_timeout: float = 2.5    # тайм-аут текста на одну страницу, с

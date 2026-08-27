@@ -587,6 +587,156 @@ def _extract_geometry_bounded(page: Any, timeout: float):
     return (box["lines"], box["curves"]) if box["done"] else None
 
 
+_PYMUPDF_GEO_WORKER = r"""
+import json, sys, math
+import pymupdf
+
+def is_cable_color(c):
+    if not c:
+        return False
+    try:
+        mx, mn = max(c), min(c)
+    except Exception:
+        return False
+    if mx - mn < 0.15 or mx < 0.3:
+        return False
+    return True
+
+def color_label(c):
+    if not c:
+        return "none"
+    try:
+        return "rgb(%d,%d,%d)" % tuple(int(round(x * 255)) for x in c)
+    except Exception:
+        return "none"
+
+MIN_LEN = 1.0     # отсекаем штриховку (миллионы коротких отрезков)
+MAX_RECS = 20000  # защита от раздувания данных
+
+
+def main():
+    path, out, pages_json = sys.argv[1], sys.argv[2], sys.argv[3]
+    pages = json.loads(pages_json)  # list of [pn, has_plan_marker]
+    doc = pymupdf.open(path)
+    f = open(out, "w", encoding="utf-8")
+    written = 0
+    for pn, has_plan in pages:
+        if not has_plan:
+            continue
+        if pn < 1 or pn > len(doc):
+            continue
+        try:
+            drawings = doc[pn - 1].get_drawings()
+        except Exception:
+            continue
+        for d in drawings:
+            if written >= MAX_RECS:
+                break
+            # только обводка (штриховки/заливки «f» пропускаем)
+            dtype = d.get("type")
+            if dtype and dtype not in ("s", "fs"):
+                continue
+            color = d.get("color")
+            rgb = None
+            if color:
+                try:
+                    rgb = tuple(float(x) for x in color)
+                except Exception:
+                    rgb = None
+            for item in d.get("items", []):
+                if written >= MAX_RECS:
+                    break
+                L = 0.0
+                if item[0] == "l":
+                    p1, p2 = item[1], item[2]
+                    L = math.hypot(p2.x - p1.x, p2.y - p1.y)
+                elif item[0] == "c":
+                    pts = [item[1]] + list(item[2:])
+                    for a, b in zip(pts, pts[1:]):
+                        L += math.hypot(b.x - a.x, b.y - a.y)
+                else:
+                    continue
+                if L < MIN_LEN:
+                    continue
+                f.write(json.dumps({
+                    "layer": color_label(rgb),
+                    "type": "LINE" if item[0] == "l" else "CURVE",
+                    "length": round(L, 3),
+                    "likely_cable": is_cable_color(rgb),
+                }) + "\n")
+                written += 1
+        if written >= MAX_RECS:
+            break
+    doc.close()
+    f.close()
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def _extract_plan_lengths_pymupdf(
+    path: Path, page_texts: dict[int, str], slow_pages: set[int]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Измеряет линии/кривые на страницах-планах через PyMuPDF get_drawings.
+
+    Работает в отдельном процессе с жёстким бюджетом: векторные страницы
+    CAD-экспортов могут разбираться десятки секунд, но это не должно
+    блокировать основной разбор. stderr заглушён (MuPDF пишет туда «syntax
+    error» на битых числах). Возвращает ([], notes), если PyMuPDF недоступен.
+    """
+    try:
+        import pymupdf  # noqa: F401
+    except ImportError:
+        return [], ["PyMuPDF недоступен — геометрия планов не измерена."]
+    from app.config import settings
+
+    pages = [
+        [pn, any(m in ptext.lower() for m in _PLAN_PAGE_MARKERS)]
+        for pn, ptext in page_texts.items()
+        if pn not in slow_pages
+    ]
+    if not any(has for _, has in pages):
+        return [], []
+    tmp = Path(tempfile.mkdtemp(prefix="pymupdfgeo_"))
+    worker = tmp / "worker.py"
+    out = tmp / "out.jsonl"
+    notes: list[str] = []
+    try:
+        worker.write_text(_PYMUPDF_GEO_WORKER, encoding="utf-8")
+        proc = subprocess.Popen(
+            [str(sys.executable), str(worker), str(path), str(out), json.dumps(pages)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        budget = float(getattr(settings, "pdf_geometry_budget", 30.0) or 30.0)
+        try:
+            proc.wait(timeout=budget)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            notes.append("Геометрия планов прервана по бюджету — измерение трасс неполное.")
+        lengths: list[dict[str, Any]] = []
+        if out.exists():
+            for line in out.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    lengths.append(json.loads(line))
+                except Exception:
+                    continue
+        return lengths, notes
+    except Exception as exc:
+        notes.append(f"pymupdf-geometry: {exc}")
+        return [], notes
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _extract_plan_lengths(
     pdf: Any,
     page_texts: dict[int, str],
@@ -739,6 +889,116 @@ def _words_to_lines(words: list, y_tol: float = 4.0) -> list[str]:
     return out
 
 
+_JOURNAL_PAGE_MARKERS = (
+    "кабельный журнал",
+    "маркировка кабеля",
+    "числов и сечение",
+    "направление кабеля",
+    "заводская марка",
+    "монтажная единица",
+)
+
+
+def _is_journal_page(text: str) -> bool:
+    low = (text or "").lower()
+    return any(m in low for m in _JOURNAL_PAGE_MARKERS)
+
+
+def _journal_columns(rows: list[list[str]]) -> tuple[int | None, int | None, int | None]:
+    """Индексы колонок «марка / сечение / длина» по строкам-заголовкам таблицы журнала."""
+    mark_c = sec_c = len_c = None
+    for row in rows[:4]:
+        for i, c in enumerate(row):
+            cl = str(c or "").lower()
+            if mark_c is None and "марка" in cl and "обознач" not in cl:
+                mark_c = i
+            if sec_c is None and ("сечение" in cl or "число и сечение" in cl):
+                sec_c = i
+            if len_c is None and "длина" in cl:
+                len_c = i
+    return mark_c, sec_c, len_c
+
+
+def _parse_journal_tables_pymupdf(path: Path, page_texts: dict[int, str]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Разбор кабельного журнала через find_tables (сеточные таблицы журнала).
+
+    Работает для обоих форматов журналов: «Маркировка кабеля | Марка | Длина»
+    (СС3) и «Обозначение | Заводская марка | Направление | Длина, м» (ПС).
+    Возвращает (записи, notes).
+    """
+    try:
+        import pymupdf
+    except ImportError:
+        return [], ["PyMuPDF недоступен — таблицы журнала не разобраны."]
+    _quiet_mupdf()
+    journal: list[dict[str, Any]] = []
+    notes: list[str] = []
+    doc = pymupdf.open(str(path))
+    try:
+        for pn, ptext in page_texts.items():
+            if not _is_journal_page(ptext):
+                continue
+            if pn < 1 or pn > len(doc):
+                continue
+            try:
+                tabs = doc[pn - 1].find_tables()
+            except Exception:
+                continue
+            page_hits = 0
+            page_totals = 0
+            for t in tabs.tables:
+                rows = [[("" if c is None else str(c)) for c in row] for row in t.extract()]
+                if not rows:
+                    continue
+                mark_c, sec_c, len_c = _journal_columns(rows)
+                if mark_c is None and len_c is None:
+                    continue
+                in_total = False
+                for row in rows:
+                    joined = " ".join(str(c) for c in row).lower()
+                    if "итого" in joined:
+                        in_total = True
+                    is_total = in_total
+                    if mark_c is None or mark_c >= len(row):
+                        continue
+                    mark = str(row[mark_c]).strip()
+                    if not mark:
+                        continue
+                    length = parse_float(row[len_c]) if (len_c is not None and len_c < len(row)) else None
+                    if length is None and is_total:
+                        # запасной вариант: последнее число строки
+                        nums = [parse_float(str(c)) for c in row if str(c).strip()]
+                        nums = [n for n in nums if n is not None]
+                        length = nums[-1] if nums else None
+                    section_raw = str(row[sec_c]).strip() if (sec_c is not None and sec_c < len(row)) else ""
+                    parsed = parse_section(section_raw) if section_raw else None
+                    journal.append(
+                        {
+                            "name": mark,
+                            "mark": mark,
+                            "type": "",
+                            "section": parsed,
+                            "length": length,
+                            "qty": None,
+                            "from": "",
+                            "to": "",
+                            "sheet": f"p{pn}_journal",
+                            "is_total": is_total,
+                        }
+                    )
+                    if is_total:
+                        page_totals += 1
+                    else:
+                        page_hits += 1
+            if page_hits or page_totals:
+                notes.append(
+                    f"Кабельный журнал (стр. {pn}): {page_hits} строк, {page_totals} итогов."
+                )
+    finally:
+        doc.close()
+    return journal, notes
+
+
 def _parse_journal_lines_pymupdf(path: Path, page_texts: dict[int, str]) -> tuple[list[dict[str, Any]], list[str]]:
     """Разбор кабельного журнала через координаты слов PyMuPDF.
 
@@ -754,7 +1014,7 @@ def _parse_journal_lines_pymupdf(path: Path, page_texts: dict[int, str]) -> tupl
     doc = pymupdf.open(str(path))
     try:
         for pn, ptext in page_texts.items():
-            if "кабельный журнал" not in ptext.lower():
+            if not _is_journal_page(ptext):
                 continue
             if pn < 1 or pn > len(doc):
                 continue
@@ -799,7 +1059,7 @@ def _parse_journal_lines(page_texts: dict[int, str]) -> tuple[list[dict[str, Any
     notes: list[str] = []
     for pn, ptext in page_texts.items():
         low = ptext.lower()
-        if "кабельный журнал" not in low:
+        if not _is_journal_page(ptext):
             continue
         hits = 0
         for line in ptext.splitlines():
@@ -844,32 +1104,28 @@ def parse_pdf(path: Path) -> dict[str, Any]:
 
     _quiet_pypdf()
 
-    # 1) Текст — в отдельном процессе с жёстким бюджетом. Некоторые страницы
-    #    (планы с плотной векторной графикой) разбираются pypdf десятки секунд;
-    #    в потоке их не прервать, а утечки потоков выжигают бюджет разбора
-    #    таблиц (спецификация/журнал оставались без таблиц). Процесс убивается
-    #    целиком, поэтому таблицы спецификации разбираются стабильно.
+    # 1) Текст. Основной экстрактор — PyMuPDF: он быстр (миллисекунды на
+    #    страницу) и корректно собирает слова даже в PDF, экспортированных из
+    #    CAD/XPS (где pypdf отдаёт текст посимвольно). Каскад: PyMuPDF → pypdf
+    #    → pdftotext → pdfplumber. Никаких постраничных тайм-аутов и «зависших»
+    #    страниц: весь текст извлекается целиком в отдельном процессе.
     text_parts: list[str] = []
     tables: list[dict[str, Any]] = []
     notes = []
     slow_pages: set[int] = set()
-    text_budget = float(getattr(settings, "pdf_text_budget", 60.0) or 60.0)
+    text_budget = float(getattr(settings, "pdf_text_budget", 120.0) or 120.0)
     text_page_timeout = float(getattr(settings, "pdf_text_page_timeout", 2.5) or 2.5)
-    text_parts, t_notes = _extract_pdf_text_subprocess(path, text_budget, text_page_timeout)
-    notes.extend(t_notes)
 
-    # pypdf на PDF, экспортированных из CAD/XPS, может вернуть посимвольный
-    # текст («И\nн\nв\n. ...») — тогда слова не склеиваются и спецификация/
-    # журнал не распознаются. Переизвлекаем каскадом быстрых экстракторов:
-    # PyMuPDF → pdftotext (poppler) → pdfplumber.
-    if _text_is_garbled("\n".join(text_parts)) or not text_parts:
+    mupdf_parts, t_notes = _extract_pymupdf_text_subprocess(path, text_budget)
+    notes.extend(t_notes)
+    if mupdf_parts:
+        text_parts = mupdf_parts
+    else:
+        # PyMuPDF недоступен — pypdf с постраничным тайм-аутом
+        text_parts, t_notes = _extract_pdf_text_subprocess(path, text_budget, text_page_timeout)
+        notes.extend(t_notes)
         if _text_is_garbled("\n".join(text_parts)):
             notes.append("Текст pypdf посимвольный (экспорт CAD/XPS) — переизвлечение.")
-        mupdf_parts, t_notes = _extract_pymupdf_text_subprocess(path, text_budget)
-        notes.extend(t_notes)
-        if mupdf_parts:
-            text_parts = mupdf_parts
-        else:
             pdftotext_parts, t_notes = _extract_text_pdftotext(path, text_budget)
             notes.extend(t_notes)
             if pdftotext_parts:
@@ -879,7 +1135,7 @@ def parse_pdf(path: Path) -> dict[str, Any]:
                 notes.extend(t_notes)
 
     if not text_parts:
-        # запасной вариант: pdfplumber в потоке (если подпроцесс недоступен)
+        # последний запасной вариант: pdfplumber в потоке
         try:
             import pdfplumber
 
@@ -893,8 +1149,8 @@ def parse_pdf(path: Path) -> dict[str, Any]:
         except Exception as exc:
             notes.append(f"pdfplumber: {exc}")
 
-    # страницы, не попавшие в текст (медленные/векторные), помечаем —
-    # их не даём и на разбор таблиц/геометрии
+    # страницы, не попавшие в текст, помечаем как «медленные» — их не даём
+    # на разбор таблиц/геометрии. При PyMuPDF-пути таких страниц не бывает.
     have_text = set()
     for tp in text_parts:
         m = re.match(r"--- страница (\d+) ---\n?", tp)
@@ -921,82 +1177,125 @@ def parse_pdf(path: Path) -> dict[str, Any]:
         if m:
             page_texts[int(m.group(1))] = tp
 
-    # 2) Таблицы — best-effort с жёсткими лимитами времени.
-    #    Сначала обрабатываем страницы с явными табличными признаками
-    #    (спецификация, кабельный журнал) — они быстрые; планы и схемы,
-    #    где pdfplumber может «зависнуть», идут вторыми, если останется бюджет.
+    # 2) Таблицы. Основной разбор — PyMuPDF find_tables (быстрый, без лимитов
+    #    времени и пропусков листов). pdfplumber — только как запасной вариант,
+    #    если PyMuPDF недоступен или не нашёл таблиц.
     if len(text) >= 40:
-        try:
-            import pdfplumber
+        def _priority(pn: int) -> int:
+            low = page_texts.get(pn, "").lower()
+            # 0 — явные маркеры спецификации (ГОСТ 21.110) и кабельного журнала.
+            #    «спецификац» ловит и обрыв строки «Спецификация оборудовани…»
+            #    в CAD-экспорте. Эти страницы разбираются первыми.
+            if any(
+                k in low
+                for k in (
+                    "спецификац",
+                    "кабельный журнал",
+                    "направление кабеля",
+                    "потребность кабелей",
+                )
+            ):
+                return 0
+            # 1 — таблицы вида «Поз. | Наименование | Кол. | Примечание»
+            if "поз." in low and "наименование" in low:
+                return 1
+            # 2 — прочие табличные страницы
+            if "наименование" in low and "кол." in low:
+                return 2
+            if any(k in low for k in ("наименование", "обозначение", "примечание", "марка", "длина")):
+                return 3
+            return 4  # планы/чертежи, где «кол.» — из штампа: пропускаем
 
-            budget = float(getattr(settings, "pdf_table_budget", 15.0) or 15.0)
-            page_timeout = float(getattr(settings, "pdf_table_page_timeout", 6.0) or 6.0)
+        candidates = sorted(
+            [
+                pn
+                for pn in page_texts
+                # страницы кабельного журнала разбираются отдельно
+                # (_parse_journal_tables_pymupdf); в общие items они не идут,
+                # иначе строки журнала удваивают позиции спецификации.
+                # Разбираем только явные табличные страницы (спецификация и
+                # перечни «Поз.|Наименование»): страницы схем с векторной
+                # графикой (приоритет 2–3) могут «виснуть» в find_tables.
+                if _priority(pn) <= 1
+                and pn not in slow_pages
+                and not _is_journal_page(page_texts.get(pn, ""))
+            ],
+            key=lambda pn: (_priority(pn), pn),
+        )
 
-            def _priority(pn: int) -> int:
-                low = page_texts.get(pn, "").lower()
-                # 0 — явные маркеры спецификации (ГОСТ 21.110) и кабельного журнала.
-                #    «спецификац» ловит и обрыв строки «Спецификация оборудовани…»
-                #    в CAD-экспорте. Эти страницы разбираются первыми.
-                if any(
-                    k in low
-                    for k in (
-                        "спецификац",
-                        "кабельный журнал",
-                        "направление кабеля",
-                        "потребность кабелей",
-                    )
-                ):
-                    return 0
-                # 1 — таблицы вида «Поз. | Наименование | Кол. | Примечание»
-                #    (перечни элементов, спецификации без явного заголовка)
-                if "поз." in low and "наименование" in low:
-                    return 1
-                # 2 — прочие табличные страницы
-                if "наименование" in low and "кол." in low:
-                    return 2
-                if any(k in low for k in ("наименование", "обозначение", "примечание", "марка", "длина")):
-                    return 3
-                return 4  # планы/чертежи, где «кол.» — из штампа: пропускаем
-
-            candidates = sorted(
-                [pn for pn in page_texts if _priority(pn) <= 3 and pn not in slow_pages],
-                key=lambda pn: (_priority(pn), pn),
-            )
-
-            deadline = time.monotonic() + budget
-            with pdfplumber.open(str(path)) as pdf:
-                for pn in candidates:
-                    if pn > len(pdf.pages):
+        def _build_tables(per_page: dict[int, list[list[list[str]]]]) -> None:
+            for pn in candidates:
+                for ti, table in enumerate(per_page.get(pn, [])):
+                    rows = [[_cell(c) for c in row] for row in table if row]
+                    if not rows:
                         continue
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        notes.append("Лимит времени на разбор таблиц PDF исчерпан — часть таблиц пропущена.")
-                        break
-                    page = pdf.pages[pn - 1]
-                    extracted = _extract_tables_bounded(page, min(page_timeout, remaining))
-                    for ti, table in enumerate(extracted):
-                        if not table:
-                            continue
-                        rows = [[_cell(c) for c in row] for row in table if row]
-                        if not rows:
-                            continue
+                    hi = _header_row(rows)
+                    if hi is None:
                         headers = rows[0]
-                        mapped = _map_headers(headers)
-                        records = []
-                        for row in rows[1:]:
-                            rec = {k: row[idx] if idx < len(row) else "" for k, idx in mapped.items()}
-                            rec["_raw"] = row
-                            records.append(rec)
-                        tables.append(
-                            {
-                                "sheet": f"p{pn}_t{ti + 1}",
-                                "headers": headers,
-                                "mapped": mapped,
-                                "records": records,
-                            }
-                        )
-        except Exception as exc:
-            notes.append(f"pdfplumber-tables: {exc}")
+                        body = rows[1:]
+                    else:
+                        headers = rows[hi]
+                        body = rows[hi + 1 :]
+                    mapped = _map_headers(headers)
+                    records = []
+                    for row in body:
+                        rec = {k: row[idx] if idx < len(row) else "" for k, idx in mapped.items()}
+                        rec["_raw"] = row
+                        records.append(rec)
+                    tables.append(
+                        {
+                            "sheet": f"p{pn}_t{ti + 1}",
+                            "headers": headers,
+                            "mapped": mapped,
+                            "records": records,
+                        }
+                    )
+
+        mupdf_tables, t_notes = _pymupdf_page_tables_subprocess(path, candidates)
+        notes.extend(t_notes)
+        if mupdf_tables:
+            _build_tables(mupdf_tables)
+        else:
+            # PyMuPDF недоступен — pdfplumber с жёсткими лимитами времени
+            try:
+                import pdfplumber
+
+                budget = float(getattr(settings, "pdf_table_budget", 30.0) or 30.0)
+                page_timeout = float(getattr(settings, "pdf_table_page_timeout", 6.0) or 6.0)
+                deadline = time.monotonic() + budget
+                with pdfplumber.open(str(path)) as pdf:
+                    for pn in candidates:
+                        if pn > len(pdf.pages):
+                            continue
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            notes.append("Лимит времени на разбор таблиц PDF исчерпан — часть таблиц пропущена.")
+                            break
+                        page = pdf.pages[pn - 1]
+                        extracted = _extract_tables_bounded(page, min(page_timeout, remaining))
+                        for ti, table in enumerate(extracted):
+                            if not table:
+                                continue
+                            rows = [[_cell(c) for c in row] for row in table if row]
+                            if not rows:
+                                continue
+                            headers = rows[0]
+                            mapped = _map_headers(headers)
+                            records = []
+                            for row in rows[1:]:
+                                rec = {k: row[idx] if idx < len(row) else "" for k, idx in mapped.items()}
+                                rec["_raw"] = row
+                                records.append(rec)
+                            tables.append(
+                                {
+                                    "sheet": f"p{pn}_t{ti + 1}",
+                                    "headers": headers,
+                                    "mapped": mapped,
+                                    "records": records,
+                                }
+                            )
+            except Exception as exc:
+                notes.append(f"pdfplumber-tables: {exc}")
 
     if len(text) < 40:
         ocr_text, ocr_note = _ocr_pdf(path)
@@ -1023,23 +1322,39 @@ def parse_pdf(path: Path) -> dict[str, Any]:
                     cables.append(item)
 
     # 3) Геометрия планов — измерение трасс (цветные линии/кривые).
+    #    PyMuPDF get_drawings — основной путь; pdfplumber — только если
+    #    PyMuPDF недоступен (иначе «зависшие» векторные страницы жгут время).
     lengths: list[dict[str, Any]] = []
     if page_texts:
         try:
-            import pdfplumber
+            import pymupdf  # noqa: F401
 
-            geo_timeout = float(getattr(settings, "pdf_text_page_timeout", 2.5) or 2.5) * 4
-            with pdfplumber.open(str(path)) as pdf:
-                lengths, geo_notes = _extract_plan_lengths(pdf, page_texts, slow_pages, geo_timeout)
-                notes.extend(geo_notes)
-        except Exception as exc:
-            notes.append(f"pdf-geometry: {exc}")
+            has_mupdf = True
+        except ImportError:
+            has_mupdf = False
+        if has_mupdf:
+            lengths, geo_notes = _extract_plan_lengths_pymupdf(path, page_texts, slow_pages)
+            notes.extend(geo_notes)
+        else:
+            try:
+                import pdfplumber
 
-    # 4) Кабельный журнал (CAD-экспорт): extract_tables не детектирует колонки
-    #    журнала, но строки «… МАРКА … ДЛИНА» есть в тексте/координатах слов.
+                geo_timeout = float(getattr(settings, "pdf_text_page_timeout", 2.5) or 2.5) * 4
+                with pdfplumber.open(str(path)) as pdf:
+                    lengths, geo_notes = _extract_plan_lengths(pdf, page_texts, slow_pages, geo_timeout)
+                    notes.extend(geo_notes)
+            except Exception as exc:
+                notes.append(f"pdf-geometry: {exc}")
+
+    # 4) Кабельный журнал. Основной разбор — сеточные таблицы журнала через
+    #    find_tables (форматы СС3 «Марка|Длина» и ПС «Заводская марка|Длина, м»);
+    #    строковый парсер по координатам слов — запасной.
     journal_items: list[dict[str, Any]] = []
-    journal_items, jn = _parse_journal_lines_pymupdf(path, page_texts)
+    journal_items, jn = _parse_journal_tables_pymupdf(path, page_texts)
     notes.extend(jn)
+    if not journal_items:
+        journal_items, jn = _parse_journal_lines_pymupdf(path, page_texts)
+        notes.extend(jn)
     if not journal_items:
         journal_items, jn = _parse_journal_lines(page_texts)
         notes.extend(jn)
@@ -1339,6 +1654,110 @@ HEADER_ALIASES: dict[str, tuple[str, ...]] = {
     "note": ("примеч", "примечание", "note"),
     "manufacturer": ("завод", "изготов", "произв"),
 }
+
+
+def _quiet_mupdf() -> None:
+    """Заглушает вывод ошибок/предупреждений MuPDF в stderr.
+
+    На PDF, экспортированных из CAD/XPS, MuPDF пишет сотни «syntax error:
+    unknown keyword» на битых числах — это шум, засоряющий журнал сервера.
+    """
+    try:
+        import pymupdf
+
+        pymupdf.TOOLS.mupdf_display_errors(False)
+        pymupdf.TOOLS.mupdf_display_warnings(False)
+    except Exception:
+        pass
+
+
+_PYMUPDF_TABLES_WORKER = r"""
+import json, sys
+import pymupdf
+pymupdf.TOOLS.mupdf_display_errors(False)
+pymupdf.TOOLS.mupdf_display_warnings(False)
+
+def main():
+    path, out, pages_json = sys.argv[1], sys.argv[2], sys.argv[3]
+    pages = json.loads(pages_json)  # список номеров страниц в порядке приоритета
+    doc = pymupdf.open(path)
+    f = open(out, "w", encoding="utf-8")
+    for pn in pages:
+        if pn < 1 or pn > len(doc):
+            continue
+        try:
+            tabs = doc[pn - 1].find_tables()
+        except Exception:
+            continue
+        for t in tabs.tables:
+            try:
+                data = t.extract()
+            except Exception:
+                continue
+            if not data:
+                continue
+            f.write(json.dumps([pn, [[("" if c is None else str(c)) for c in row] for row in data]]) + "\n")
+            f.flush()
+    doc.close()
+    f.close()
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def _pymupdf_page_tables_subprocess(path: Path, pages: list[int]) -> tuple[dict[int, list[list[list[str]]]], list[str]]:
+    """Таблицы страниц через PyMuPDF find_tables в отдельном процессе с бюджетом.
+
+    find_tables на «векторных» страницах схем может занимать 25–35 с; процесс
+    обрабатывает страницы в порядке приоритета (спецификация/журнал — первыми)
+    и убивается по бюджету, не блокируя основной разбор. Возвращает
+    ({номер_страницы: [таблицы...]}, notes).
+    """
+    try:
+        import pymupdf  # noqa: F401
+    except ImportError:
+        return {}, ["PyMuPDF недоступен — таблицы не разобраны."]
+    from app.config import settings
+
+    tmp = Path(tempfile.mkdtemp(prefix="pymupdftbl_"))
+    worker = tmp / "worker.py"
+    out = tmp / "out.jsonl"
+    notes: list[str] = []
+    try:
+        worker.write_text(_PYMUPDF_TABLES_WORKER, encoding="utf-8")
+        proc = subprocess.Popen(
+            [str(sys.executable), str(worker), str(path), str(out), json.dumps(pages)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        budget = float(getattr(settings, "pdf_table_budget", 30.0) or 30.0)
+        try:
+            proc.wait(timeout=budget)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            notes.append("Разбор таблиц прерван по бюджету — часть схемных перечней пропущена.")
+        per_page: dict[int, list[list[list[str]]]] = {}
+        if out.exists():
+            for line in out.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    pn, tables_data = json.loads(line)
+                    per_page.setdefault(int(pn), []).append(tables_data)
+                except Exception:
+                    continue
+        return per_page, notes
+    except Exception as exc:
+        notes.append(f"pymupdf-tables: {exc}")
+        return {}, notes
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _header_row(rows: list[list[Any]]) -> int | None:
