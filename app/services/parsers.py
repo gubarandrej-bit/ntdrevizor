@@ -1197,30 +1197,25 @@ def parse_pdf(path: Path) -> dict[str, Any]:
     #    времени и пропусков листов). pdfplumber — только как запасной вариант,
     #    если PyMuPDF недоступен или не нашёл таблиц.
     if len(text) >= 40:
+        def _is_spec_page(low: str) -> bool:
+            # «Спецификация оборудования…» (ГОСТ 21.110) или шифр листа «.СО»
+            # (спецификация оборудования) на листах продолжения таблицы
+            return "спецификац" in low or ".со" in low
+
         def _priority(pn: int) -> int:
             low = page_texts.get(pn, "").lower()
-            # 0 — явные маркеры спецификации (ГОСТ 21.110) и кабельного журнала.
-            #    «спецификац» ловит и обрыв строки «Спецификация оборудовани…»
-            #    в CAD-экспорте. Эти страницы разбираются первыми.
-            if any(
-                k in low
-                for k in (
-                    "спецификац",
-                    "кабельный журнал",
-                    "направление кабеля",
-                    "потребность кабелей",
-                )
-            ):
+            # схемные «Перечень элементов» — это не спецификация, а список
+            # оборудования схем; он дублирует позиции спецификации и содержит
+            # десятки мелких таблиц, на которых find_tables медленный. Пропускаем.
+            if "перечень элемент" in low:
+                return 4
+            if _is_spec_page(low):
                 return 0
             # 1 — таблицы вида «Поз. | Наименование | Кол. | Примечание»
-            if "поз." in low and "наименование" in low:
+            #    (для проектов, где листы спецификации не помечены «.СО»)
+            if "поз." in low and "наименование" in low and "условные обозначен" not in low:
                 return 1
-            # 2 — прочие табличные страницы
-            if "наименование" in low and "кол." in low:
-                return 2
-            if any(k in low for k in ("наименование", "обозначение", "примечание", "марка", "длина")):
-                return 3
-            return 4  # планы/чертежи, где «кол.» — из штампа: пропускаем
+            return 4  # планы/чертежи/схемы — таблицы не разбираем
 
         candidates = sorted(
             [
@@ -1229,9 +1224,6 @@ def parse_pdf(path: Path) -> dict[str, Any]:
                 # страницы кабельного журнала разбираются отдельно
                 # (_parse_journal_tables_pymupdf); в общие items они не идут,
                 # иначе строки журнала удваивают позиции спецификации.
-                # Разбираем только явные табличные страницы (спецификация и
-                # перечни «Поз.|Наименование»): страницы схем с векторной
-                # графикой (приоритет 2–3) могут «виснуть» в find_tables.
                 if _priority(pn) <= 1
                 and pn not in slow_pages
                 and not _is_journal_page(page_texts.get(pn, ""))
@@ -1677,7 +1669,12 @@ def _quiet_mupdf() -> None:
 
     На PDF, экспортированных из CAD/XPS, MuPDF пишет сотни «syntax error:
     unknown keyword» на битых числах — это шум, засоряющий журнал сервера.
+    Также отключает одноразовую подсказку «Consider using the pymupdf_layout
+    package…» (управляется переменной окружения).
     """
+    import os
+
+    os.environ.setdefault("PYMUPDF_SUGGEST_LAYOUT_ANALYZER", "0")
     try:
         import pymupdf
 
@@ -1756,7 +1753,7 @@ def _pymupdf_page_tables_subprocess(path: Path, pages: list[int]) -> tuple[dict[
                 proc.wait(timeout=5)
             except Exception:
                 pass
-            notes.append("Разбор таблиц прерван по бюджету — часть схемных перечней пропущена.")
+            notes.append("Разбор таблиц: не все страницы уложились в бюджет (схемные перечни не критичны для сверки спецификации/журнала).")
         per_page: dict[int, list[list[list[str]]]] = {}
         if out.exists():
             for line in out.read_text(encoding="utf-8").splitlines():
