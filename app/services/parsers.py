@@ -904,19 +904,31 @@ def _is_journal_page(text: str) -> bool:
     return any(m in low for m in _JOURNAL_PAGE_MARKERS)
 
 
-def _journal_columns(rows: list[list[str]]) -> tuple[int | None, int | None, int | None]:
-    """Индексы колонок «марка / сечение / длина» по строкам-заголовкам таблицы журнала."""
+_JOURNAL_HEADER_CELLS = (
+    "марка", "заводская марка", "маркировка", "кабель", "провод",
+    "кабель, провод", "тип", "сечение", "число и сечение", "длина",
+    "длина, м", "начало", "конец", "направление",
+)
+
+
+def _journal_columns(rows: list[list[str]]) -> tuple[int | None, int | None, int | None, set[int]]:
+    """Индексы колонок «марка / сечение / длина» и номера строк-заголовков."""
     mark_c = sec_c = len_c = None
-    for row in rows[:4]:
+    header_rows: set[int] = set()
+    for ri, row in enumerate(rows[:6]):
         for i, c in enumerate(row):
-            cl = str(c or "").lower()
-            if mark_c is None and "марка" in cl and "обознач" not in cl:
+            cl = str(c or "").lower().strip()
+            if not cl:
+                continue
+            if any(h in cl for h in ("марка", "направление кабеля", "длина", "сечение", "начало", "конец", "монтажная", "обозначение")):
+                header_rows.add(ri)
+            if mark_c is None and "марка" in cl and "обознач" not in cl and "маркировка" not in cl:
                 mark_c = i
             if sec_c is None and ("сечение" in cl or "число и сечение" in cl):
                 sec_c = i
             if len_c is None and "длина" in cl:
                 len_c = i
-    return mark_c, sec_c, len_c
+    return mark_c, sec_c, len_c, header_rows
 
 
 def _parse_journal_tables_pymupdf(path: Path, page_texts: dict[int, str]) -> tuple[list[dict[str, Any]], list[str]]:
@@ -950,11 +962,13 @@ def _parse_journal_tables_pymupdf(path: Path, page_texts: dict[int, str]) -> tup
                 rows = [[("" if c is None else str(c)) for c in row] for row in t.extract()]
                 if not rows:
                     continue
-                mark_c, sec_c, len_c = _journal_columns(rows)
+                mark_c, sec_c, len_c, header_rows = _journal_columns(rows)
                 if mark_c is None and len_c is None:
                     continue
                 in_total = False
-                for row in rows:
+                for ri, row in enumerate(rows):
+                    if ri in header_rows:
+                        continue
                     joined = " ".join(str(c) for c in row).lower()
                     if "итого" in joined:
                         in_total = True
@@ -963,6 +977,8 @@ def _parse_journal_tables_pymupdf(path: Path, page_texts: dict[int, str]) -> tup
                         continue
                     mark = str(row[mark_c]).strip()
                     if not mark:
+                        continue
+                    if mark.lower().strip() in _JOURNAL_HEADER_CELLS:
                         continue
                     length = parse_float(row[len_c]) if (len_c is not None and len_c < len(row)) else None
                     if length is None and is_total:
