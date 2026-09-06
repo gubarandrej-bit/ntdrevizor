@@ -42,7 +42,7 @@ class Settings(BaseSettings):
 
     ollama_base_url: str = "http://127.0.0.1:11434"
     local_gguf_path: str = ""
-    local_gguf_n_ctx: int = 2048
+    local_gguf_n_ctx: int = 4096
     local_gguf_n_threads: int = 4
 
     ntd_online_check: bool = True

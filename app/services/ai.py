@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -301,6 +302,69 @@ def _ollama_chat(model: str, system: str, user: str, timeout: float) -> str:
     return r.json().get("message", {}).get("content") or ""
 
 
+_FIT_TAIL_MARK = "\n…[обрезано под окно контекста локальной модели]…"
+
+
+def _fit_llamacpp_context(llm, system: str, user: str, budget: int) -> tuple[str, str, bool]:
+    """Укладывает промпт в окно контекста локальной модели.
+
+    Возвращает (system, user, truncated). Сокращение честное и помечается:
+    сначала режется конспект «Известные пункты НТД…» (наименее критичный блок),
+    затем хвост фрагмента документации — бинарным поиском длины, которая
+    гарантированно умещается. Ничего не домысливается.
+    """
+    def tk(text: str) -> int:
+        try:
+            toks = llm.tokenize(text.encode("utf-8"), add_bos=False, special=False)
+            return len(toks)
+        except Exception:
+            # консервативная оценка без токенизатора (кириллица ~2-3 знака/токен)
+            return max(1, len(text) // 3)
+
+    sys_tk = tk(system)
+
+    def fits(user_text: str) -> bool:
+        return sys_tk + tk(user_text) + 8 <= budget
+
+    truncated = False
+
+    # 1) сокращаем конспект НТД в середине user-промпта
+    pat = re.compile(
+        r"(Известные пункты НТД[^\n]*\n)(.*?)(\n\nФрагмент документации:)",
+        re.S,
+    )
+    m = pat.search(user)
+    while m and not fits(user):
+        block = m.group(2)
+        if len(block) <= 300:
+            break
+        half = block[: len(block) // 2]
+        user = (
+            user[: m.start(2)]
+            + half
+            + "\n…[конспект НТД обрезан под окно контекста локальной модели]…"
+            + user[m.end(2):]
+        )
+        truncated = True
+        m = pat.search(user)
+
+    # 2) если всё ещё не влезает — бинарный поиск максимальной длины префикса
+    if not fits(user) and len(user) > 400:
+        lo, hi = 200, len(user)
+        best = lo
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if fits(user[:mid] + _FIT_TAIL_MARK):
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        user = user[:best] + _FIT_TAIL_MARK
+        truncated = True
+
+    return system, user, truncated
+
+
 def _llamacpp_chat(system: str, user: str) -> str:
     path = settings.local_gguf_path
     if not path or not Path(path).exists():
@@ -317,13 +381,31 @@ def _llamacpp_chat(system: str, user: str) -> str:
         n_threads=settings.local_gguf_n_threads,
         verbose=False,
     )
+    max_tokens = 800
+    # бюджет на промпт = окно контекста минус генерируемый ответ и запас
+    budget = max(256, int(settings.local_gguf_n_ctx) - max_tokens - 32)
+    system, user, truncated = _fit_llamacpp_context(llm, system, user, budget)
+    try:
+        n_sys = len(llm.tokenize(system.encode("utf-8"), add_bos=False, special=False))
+        n_usr = len(llm.tokenize(user.encode("utf-8"), add_bos=False, special=False))
+    except Exception:
+        n_sys, n_usr = len(system) // 3, len(user) // 3
+    if n_sys + n_usr + max_tokens > int(settings.local_gguf_n_ctx):
+        raise RuntimeError(
+            f"Промпт не умещается даже после обрезки: {n_sys + n_usr} токенов при окне "
+            f"{settings.local_gguf_n_ctx}. Увеличьте LOCAL_GGUF_N_CTX в .env (например 8192) "
+            f"или выберите облачную модель."
+        )
+    if truncated:
+        # честная пометка для модели, что она видит урезанный фрагмент
+        system = system.rstrip() + "\n\nВнимание: промпт был урезан, чтобы уместиться в окно контекста локальной модели. Работай только по видимому фрагменту."
     out = llm.create_chat_completion(
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
         temperature=0.1,
-        max_tokens=800,
+        max_tokens=max_tokens,
     )
     return out["choices"][0]["message"]["content"]
 
