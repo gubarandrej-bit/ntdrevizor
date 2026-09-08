@@ -199,7 +199,7 @@ def check_spec_journal_names(spec_items: list[dict], journal: list[dict]) -> dic
     if not journal:
         return _skip("Кабельный журнал не разобран или не загружен.")
 
-    spec_cables = [i for i in spec_items if _is_cable_item(i) and _is_material_line(i)]
+    spec_cables = _spec_cable_positions(spec_items)
     if not spec_cables:
         return {
             "status": "done",
@@ -268,7 +268,7 @@ def check_spec_journal_qty(spec_items: list[dict], journal: list[dict], tol_pct:
         return _skip("Спецификация не разобрана — количества сверить нельзя.")
     if not journal:
         return _skip("Кабельный журнал не разобран — количества сверить нельзя.")
-    spec_cables = [i for i in spec_items if _is_cable_item(i) and _is_material_line(i)]
+    spec_cables = _spec_cable_positions(spec_items)
     if not spec_cables:
         return _skip("В спецификации не выделены кабельные позиции с количеством/длиной.")
 
@@ -371,8 +371,8 @@ def _cable_brand(i: dict) -> str:
     for k in ("manufacturer", "mark", "type"):
         v = str(i.get(k) or "").strip()
         if v and (looks_like_cable(v) or by_name):
-            return v
-    return str(i.get("mark") or i.get("name") or "").strip()
+            return _strip_vendor(v)
+    return _strip_vendor(str(i.get("mark") or i.get("name") or "").strip())
 
 
 def _strip_section_from_mark(mark: str) -> str:
@@ -422,6 +422,127 @@ def _fuzzy_in(key: str, mapping: dict) -> bool:
     return False
 
 
+# ---------- составные позиции (ОКЛ) и строки-продолжения ----------
+
+# Префиксы производителей, которые в спецификации пишут перед маркой
+# («СПЕЦЛАН SF/UTP …»), а в кабельном журнале опускают. Убираем только
+# префикс, за которым идёт разделитель, чтобы не трогать саму марку.
+_VENDOR_PREFIXES = (
+    "спецлан", "спецкаблайн", "спецкабель", "камкабель", "инкаб",
+    "москабель", "энергокабель", "сегмент", "людиновокабель",
+)
+
+# «- кабель МАРКА … - 18 м;» — длина вложения в хвосте строки
+_COMPOSITE_LEN_RE = re.compile(r"[-–—]\s*(\d+(?:[.,]\d+)?)\s*м(?:\.?\s*п)?\s*[;.,]?\s*$")
+
+# Начало новой позиции спецификации внутри наименования: «1.», «3.1», «12)»
+_POSITION_LEAD_RE = re.compile(r"^\s*\d+(?:[.,]\d+)*\s*[.)]\s+")
+
+
+def _strip_vendor(mark: str) -> str:
+    """Убирает префикс производителя из марки кабеля («СПЕЦЛАН SF/UTP…» → «SF/UTP…»)."""
+    t = str(mark or "").strip()
+    low = t.lower()
+    for v in _VENDOR_PREFIXES:
+        if low.startswith(v) and len(t) > len(v) and t[len(v)] in " /-":
+            t = t[len(v):].lstrip(" /-")
+            break
+    return t
+
+
+def _merged_spec_rows(spec_items: list[dict]) -> list[dict]:
+    """Сливает строки-продолжения спецификации с родительской позицией.
+
+    В CAD-экспортах длинное описание позиции разбито на несколько строк
+    таблицы: «Кабель … СПЕЦЛАН SF/UTP Cat5e ZH» + «нг(А)-HF 4x2x0,52».
+    Строка считается продолжением, только если:
+      * у предыдущей строки заполнен номер позиции (иначе в документах, где
+        номер позиции живёт внутри наименования, строки склеивать нельзя);
+      * у самой строки номер позиции пуст, она не начинается с «-» (это уже
+        вложение составной позиции ОКЛ) и не начинает новую позицию
+        («N.», «N.N», «N)» в начале наименования).
+    """
+    merged: list[dict] = []
+    for it in spec_items:
+        pos = str(it.get("pos") or "").strip()
+        name = re.sub(r"\s+", " ", str(it.get("name") or "")).strip()
+        if (
+            merged
+            and not pos
+            and name
+            and merged[-1].get("pos")
+            and not name.startswith(("-", "–", "—"))
+            and not _POSITION_LEAD_RE.match(name)
+            and it.get("sheet") == merged[-1].get("sheet")
+        ):
+            prev = merged[-1]
+            prev["name"] = (str(prev.get("name") or "") + " " + name).strip()
+            m = str(it.get("mark") or "").strip()
+            if m:
+                prev["mark"] = (str(prev.get("mark") or "") + " " + m).strip()
+            if not prev.get("section"):
+                prev["section"] = parse_section(
+                    " ".join(str(prev.get(k) or "") for k in ("mark", "name", "type"))
+                )
+            continue
+        merged.append(dict(it))
+    return merged
+
+
+def _composite_cable_item(i: dict) -> dict | None:
+    """Вложение составной позиции (ОКЛ): «- кабель МАРКА … - N м;».
+
+    Возвращает материальную кабельную позицию с длиной из хвоста строки
+    либо None, если строка не является вложенным кабелем с длиной.
+    """
+    name = re.sub(r"\s+", " ", str(i.get("name") or "")).strip()
+    if not name or not re.match(r"^[-–—]\s+", name):
+        return None
+    if "кабеленесущ" in name.lower():
+        return None
+    if not looks_like_cable(name):
+        return None
+    m = _COMPOSITE_LEN_RE.search(name)
+    if not m:
+        return None
+    length = parse_float(m.group(1))
+    if length is None:
+        return None
+    clean = _COMPOSITE_LEN_RE.sub("", name).rstrip(" ;,.-–—").strip()
+    mark = clean
+    mm = re.match(r"^[-–—]\s*(?:кабел[ььяюея]?|провод[ауомеы]?)\s+", clean, re.IGNORECASE)
+    if mm:
+        mark = clean[mm.end():].strip()
+    mark = _strip_vendor(mark)
+    out = dict(i)
+    out["name"] = clean
+    out["mark"] = mark
+    out["type"] = mark
+    out["manufacturer"] = ""
+    out["length"] = length
+    out["qty"] = None
+    out["unit"] = "м"
+    out["_composite"] = True
+    if not out.get("section"):
+        out["section"] = parse_section(" ".join(str(out.get(k) or "") for k in ("mark", "name")))
+    return out
+
+
+def _spec_cable_positions(spec_items: list[dict]) -> list[dict]:
+    """Кабельные позиции спецификации для сверки с журналом: обычные
+    материальные строки (с учётом строк-продолжений) + вложенные кабели
+    составных позиций ОКЛ («- кабель … - N м»)."""
+    merged = _merged_spec_rows(spec_items)
+    out: list[dict] = []
+    for i in merged:
+        if _is_cable_item(i) and _is_material_line(i):
+            out.append(i)
+        extra = _composite_cable_item(i)
+        if extra:
+            out.append(extra)
+    return out
+
+
 # ---------- схемы ↔ спецификация ----------
 
 # Двухбуквенные обозначения по ГОСТ 2.702/2.710 — реальные устройства.
@@ -458,7 +579,7 @@ def check_spec_journal_section(spec_items: list[dict], journal: list[dict]) -> d
         return _skip("Спецификация не разобрана — тип/сечение сверить нельзя.")
     if not journal:
         return _skip("Кабельный журнал не разобран — тип/сечение сверить нельзя.")
-    spec_cables = [i for i in spec_items if _is_cable_item(i) and _is_material_line(i)]
+    spec_cables = _spec_cable_positions(spec_items)
     if not spec_cables:
         return _skip("В спецификации не выделены кабельные позиции с количеством/длиной.")
 
