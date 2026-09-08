@@ -22,15 +22,18 @@ from app.services.checks import (
     check_detector_spacing,
     check_completeness,
     check_laying,
+    check_laying_params,
     check_outdated_ntd_refs,
     check_plan_lengths,
     check_power_source,
     check_protection,
+    check_redundancy,
     check_scheme_vs_spec,
     check_spec_journal_names,
     check_spec_journal_qty,
     check_spec_journal_section,
     check_spz_category,
+    check_spz_zones,
 )
 from app.services.classify import classify_file
 from app.services.ntd import check_actuality, clauses_for_prompt, find_outdated_refs
@@ -168,12 +171,15 @@ def _run(db: Session, audit: Audit, talk: Callable) -> None:
     if not journal_items:
         low = full_text.lower()
         if any(k in low for k in ("кабельный журнал", "направление кабеля", "потребность кабелей", "монтажная единица")):
-            # строки с длиной/направлением — это трассы кабельного журнала
-            journal_items = [
-                i
-                for i in all_items(parsed, "cables")
-                if i.get("length") is not None or i.get("from") or i.get("to")
-            ]
+            # сначала — явно разобранные строки журнала из текста (CAD-экспорт)
+            journal_items = all_items(parsed, "journal")
+            if not journal_items:
+                # строки с длиной/направлением — это трассы кабельного журнала
+                journal_items = [
+                    i
+                    for i in all_items(parsed, "cables")
+                    if i.get("length") is not None or i.get("from") or i.get("to")
+                ]
             if not journal_items:
                 journal_items = [
                     i
@@ -281,6 +287,16 @@ def _run(db: Session, audit: Audit, talk: Callable) -> None:
     _store(db, audit, "DETECTOR_SPACING", r["status"], r.get("reason", ""), r.get("findings", []))
     _announce(talk, "DETECTOR_SPACING", r)
 
+    talk("Зоны контроля и отказоустойчивость СПС (СП 484 Изм. № 1)…")
+    r = check_spz_zones(full_text, systems)
+    _store(db, audit, "SPZ_ZONES", r["status"], r.get("reason", ""), r.get("findings", []))
+    _announce(talk, "SPZ_ZONES", r)
+
+    talk("Резервирование линий питания и связи…")
+    r = check_redundancy(full_text, systems)
+    _store(db, audit, "REDUNDANCY", r["status"], r.get("reason", ""), r.get("findings", []))
+    _announce(talk, "REDUNDANCY", r)
+
     talk("Проверка сечений по нагрузке и ПУЭ…")
     r = check_cable_section(spec_items + journal_items, calc_text)
     _store(db, audit, "CABLE_SECTION", r["status"], r.get("reason", ""), r.get("findings", []))
@@ -295,6 +311,11 @@ def _run(db: Session, audit: Audit, talk: Callable) -> None:
     r = check_laying(journal_items)
     _store(db, audit, "LAYING_METHOD", r["status"], r.get("reason", ""), r.get("findings", []))
     _announce(talk, "LAYING_METHOD", r)
+
+    talk("Параметры прокладки кабелей (радиус изгиба, высота)…")
+    r = check_laying_params(full_text, journal_items)
+    _store(db, audit, "LAYING_PARAMS", r["status"], r.get("reason", ""), r.get("findings", []))
+    _announce(talk, "LAYING_PARAMS", r)
 
     talk("Огнестойкость линий СПЗ…")
     if any(s in {"PS", "SOUE", "PT"} for s in systems):

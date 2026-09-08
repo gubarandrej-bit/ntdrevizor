@@ -81,6 +81,22 @@
       "ai": false
     },
     {
+      "code": "SPZ_ZONES",
+      "title": "Зоны контроля и отказоустойчивость СПС (СП 484, Изм. № 1)",
+      "group": "пожарная автоматика",
+      "requires": ["specification"],
+      "systems": ["PS", "SOUE", "PT"],
+      "ai": false
+    },
+    {
+      "code": "REDUNDANCY",
+      "title": "Резервирование линий электропитания и линий связи",
+      "group": "пожарная автоматика",
+      "requires": ["specification"],
+      "systems": ["PS", "SOUE", "PT"],
+      "ai": false
+    },
+    {
       "code": "CABLE_SECTION",
       "title": "Выбор сечения кабеля по нагрузке и ПУЭ/ГОСТ/СП",
       "group": "кабели",
@@ -97,6 +113,13 @@
     {
       "code": "LAYING_METHOD",
       "title": "Способ прокладки и допустимость марки кабеля",
+      "group": "кабели",
+      "requires": ["cable_journal"],
+      "ai": false
+    },
+    {
+      "code": "LAYING_PARAMS",
+      "title": "Параметры прокладки кабелей (радиус изгиба, высота)",
       "group": "кабели",
       "requires": ["cable_journal"],
       "ai": false
