@@ -13,7 +13,8 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import Audit, AuditFile, CheckResult, Finding, Setting
-from app.util import loads, looks_like_cable, norm
+from app.services.checks import _composite_cable_item
+from app.util import loads, looks_like_cable, norm, parse_float
 
 
 def build_reports(db: Session, audit: Audit) -> dict[str, str]:
@@ -393,6 +394,108 @@ def _is_cable_item(it: dict) -> bool:
     return looks_like_cable(" ".join(str(it.get(k) or "") for k in ("name", "mark", "type", "manufacturer")))
 
 
+# ---------- составные позиции ОКЛ ----------
+
+def _is_okl_parent(it: dict) -> bool:
+    """Строка «Огнестойкая кабельная линия в составе: … ОКЛ …» — позиция-комплект."""
+    blob = norm(" ".join(str(it.get(k) or "") for k in ("name", "mark")))
+    return "огнестойкая кабельная линия" in blob or blob.startswith("окл ")
+
+
+def _okl_line_len(it: dict) -> float | None:
+    """Длина линии из хвоста марки/наименования («… - 27 м», «… - 247м»)."""
+    for k in ("mark", "name", "type"):
+        v = str(it.get(k) or "")
+        m = re.search(r"[-–—]\s*(\d+(?:[.,]\d+)?)\s*м(?:\.?\s*п)?\b", v)
+        if m:
+            return parse_float(m.group(1))
+    return None
+
+
+_CARR_CHANNEL_RE = re.compile(r"кабель-канал[^;]*?(\d+(?:[.,]\d+)?)\s*[xх×]\s*(\d+(?:[.,]\d+)?)\s*мм", re.I)
+_CARR_GOPHER_RE = re.compile(r"труба гофрированная[^;]*?(\d+(?:[.,]\d+)?)\s*мм", re.I)
+
+
+def _okl_carrier_from_rows(sub: list[dict], parent: dict, line_len: float | None) -> dict | None:
+    """Кабеленесущий элемент в составе ОКЛ (кабель-канал / гофротруба) из
+    строк-продолжений позиции. Крепёж (хомуты) в тексте без количества —
+    не выдумывается. Возвращает материальную строку либо None."""
+    joined = " ".join(
+        str(s.get("name") or "") + " " + str(s.get("mark") or "") for s in sub
+    )
+    disp = None
+    m = _CARR_CHANNEL_RE.search(joined)
+    if m:
+        disp = f"Кабель-канал ПВХ {m.group(1)}x{m.group(2)} мм"
+    else:
+        m2 = _CARR_GOPHER_RE.search(joined)
+        if m2:
+            disp = f"Труба гофрированная ПВХ {m2.group(1)} мм"
+    if disp is None:
+        mark = norm(str(parent.get("mark") or ""))
+        if "хд60х40" in mark:
+            disp = "Кабель-канал ПВХ 60x40 мм"
+        elif "гф20" in mark:
+            disp = "Труба гофрированная ПВХ 20 мм"
+    if disp is None:
+        return None
+    lm = re.search(r"(?:длиной|[-–—])\s*(\d+(?:[.,]\d+)?)\s*м", joined)
+    length = parse_float(lm.group(1)) if lm else line_len
+    return {
+        "name": disp,
+        "mark": "",
+        "type": "",
+        "manufacturer": "",
+        "unit": "м",
+        "qty": None,
+        "length": length,
+        "note": "в составе ОКЛ (огнестойкая кабельная линия)",
+    }
+
+
+def _okl_expand(items: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Раскладывает составные позиции ОКЛ на кабель и кабеленесущий элемент.
+
+    Возвращает (кабели, несущие элементы) — материальные строки для ВОР
+    с длинами из текста спецификации. Ничего не выдумывается: крепёж без
+    количества в тексте в ведомость не попадает.
+    """
+    cables: list[dict] = []
+    carrier: list[dict] = []
+    i = 0
+    n = len(items)
+    while i < n:
+        it = items[i]
+        if _is_okl_parent(it):
+            sheet = it.get("sheet")
+            line_len = _okl_line_len(it)
+            j = i + 1
+            sub: list[dict] = []
+            while j < n:
+                nxt = items[j]
+                if nxt.get("sheet") != sheet:
+                    break
+                if str(nxt.get("pos") or "").strip():
+                    break
+                sub.append(nxt)
+                j += 1
+            for s in sub:
+                comp = _composite_cable_item(s)
+                if comp is not None:
+                    comp["mark"] = (comp.get("mark") or "") + " (ОКЛ)"
+                    comp["name"] = (comp.get("name") or "") + " (ОКЛ)"
+                    comp["note"] = "в составе ОКЛ (огнестойкая кабельная линия)"
+                    cables.append(comp)
+            carr = _okl_carrier_from_rows(sub, it, line_len)
+            if carr is not None:
+                carrier.append(carr)
+            i = j
+            continue
+        i += 1
+    return cables, carrier
+
+
+
 def _typical_cable_aux(cab_materials: list[dict], carrier: list[dict]) -> list[tuple[str, str, float, str]]:
     """Типовые сопутствующие материалы к монтажу кабеля (если их нет в спецификации).
 
@@ -477,11 +580,17 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
     #   equip      → «Монтаж оборудования» (приборы, извещатели, блоки и т.п.)
     #   carrier    → «Монтаж кабеленесущих систем» (лотки, короба, трубы, крепёж)
     #   cab_materials → «Монтаж кабеля» (кабели + гофра/стяжки/хомуты/проходки)
+    # Составные позиции ОКЛ («Огнестойкая кабельная линия в составе: …»)
+    # раскладываются на кабель (→ «Монтаж кабеля») и кабеленесущий элемент
+    # (→ «Монтаж кабеленесущих систем») — комплект как «шт/компл» не выводится.
+    okl_cables, okl_carrier = _okl_expand(items)
     equip: list[dict] = []
     carrier: list[dict] = []
     cab_materials: list[dict] = []
     for it in items:
         if not _name(it):
+            continue
+        if _is_okl_parent(it):
             continue
         if not _is_spec_position(it):
             continue
@@ -675,7 +784,7 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
             q_disp = int(q) if q == int(q) and abs(q) < 1e6 else round(q, 2)
             _material_row(f"{mn}.", g["disp"], g["unit"], q_disp, g["note"])
 
-    if not equip and not carrier and not cab_materials:
+    if not equip and not carrier and not cab_materials and not okl_cables and not okl_carrier:
         ws.cell(row_i, 2, "Исходных данных для ведомости объёмов нет. Файл не выдумывался.")
         ws.merge_cells(start_row=row_i, start_column=2, end_row=row_i, end_column=10)
         row_i += 1
@@ -688,18 +797,22 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
             _work_type_row("Монтаж оборудования")
             _materials_under(equip)
 
-        # 2) Монтаж кабеленесущих систем
-        if carrier:
+        # 2) Монтаж кабеленесущих систем (лотки/короба/трубы + кабеленесущие
+        #    элементы в составе ОКЛ)
+        if carrier or okl_carrier:
             _work_type_row("Монтаж кабеленесущих систем")
-            _materials_under(carrier)
+            _materials_under(carrier + okl_carrier)
 
-        # 3) Монтаж кабеля (кабель + гофра/стяжки/хомуты/проходки)
-        if cab_materials:
+        # 3) Монтаж кабеля (кабель + гофра/стяжки/хомуты/проходки + кабели в
+        #    составе ОКЛ)
+        if cab_materials or okl_cables:
             _work_type_row("Монтаж кабеля")
-            _materials_under(cab_materials)
+            _materials_under(cab_materials + okl_cables)
             # типовые сопутствующие материалы (стяжки, гофротруба) — если их
             # нет в спецификации; помечаются как требующие уточнения
-            for aux_name, aux_unit, aux_qty, aux_note in _typical_cable_aux(cab_materials, carrier):
+            for aux_name, aux_unit, aux_qty, aux_note in _typical_cable_aux(
+                cab_materials + okl_cables, carrier + okl_carrier
+            ):
                 _material_row("т.", aux_name, aux_unit, aux_qty, aux_note)
 
         # 4) Пусконаладочные работы — по типам оборудования спецификации.
@@ -747,6 +860,8 @@ def _write_bov(db: Session, audit: Audit, path: Path) -> None:
         f"Источники: {', '.join(sources) if sources else 'нет'}. "
         f"Структура: вид работ → перечень материалов этой работы. "
         f"Кабельный журнал в ведомость не включается. "
+        f"Составные позиции ОКЛ («Огнестойкая кабельная линия») разложены на кабель "
+        f"и кабеленесущий элемент и помечены «в составе ОКЛ». "
         f"Строки «т.» — типовые сопутствующие материалы (стяжки, гофротруба), "
         f"добавленные по нормам расхода и требующие уточнения по проекту."
     ))
