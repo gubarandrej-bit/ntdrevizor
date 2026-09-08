@@ -29,6 +29,7 @@ from app.services.checks import (
     check_power_source,
     check_protection,
     check_redundancy,
+    check_scheme_topology,
     check_scheme_vs_spec,
     scheme_facts,
     check_spec_journal_names,
@@ -271,6 +272,11 @@ def _run(db: Session, audit: Audit, talk: Callable) -> None:
     r = check_scheme_vs_spec(spec_items, scheme_files)
     _store(db, audit, "SCHEME_VS_SPEC", r["status"], r.get("reason", ""), r.get("findings", []))
     _announce(talk, "SCHEME_VS_SPEC", r)
+
+    talk("Топология подключений (устройство ↔ клемма/цепь)…")
+    r = check_scheme_topology(spec_items, scheme_files)
+    _store(db, audit, "SCHEME_TOPOLOGY", r["status"], r.get("reason", ""), r.get("findings", []))
+    _announce(talk, "SCHEME_TOPOLOGY", r)
 
     talk("Сравнение длин трасс на планах с журналом…")
     r = check_plan_lengths(journal_items, plan_files, tol_len)

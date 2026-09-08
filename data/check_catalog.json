@@ -294,6 +294,15 @@
         "specification"
       ],
       "ai": false
+    },
+    {
+      "code": "SCHEME_TOPOLOGY",
+      "title": "Топология подключений (устройство ↔ клемма, целостность цепей)",
+      "group": "схемы",
+      "requires": [
+        "scheme_or_connections"
+      ],
+      "ai": false
     }
   ]
 }

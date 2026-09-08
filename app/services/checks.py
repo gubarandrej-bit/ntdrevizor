@@ -883,6 +883,133 @@ def check_scheme_vs_spec(spec_items: list[dict], scheme_files: list[dict]) -> di
     return {"status": "done", "reason": "", "findings": findings}
 
 
+# ---------- топология подключений (схемы) ----------
+
+_CHAIN_RE = re.compile(r"\b(?:PS|CD|QS|QD)\d+(?:[.\-][A-ZА-Я]{0,4}\d+)*\b")
+_TERM_RE = re.compile(r"\bXT\d+(?:\.\d+)?\b|\bХ[ТРSАWВ]\d+\b|\bХР\d+\b", re.I)
+
+
+def _scheme_lines_of(scheme_files: list[dict]) -> list[str]:
+    lines: list[str] = []
+    for f in scheme_files:
+        ext = f.get("extracted") or {}
+        for ln in ext.get("scheme_lines") or []:
+            lines.append(re.sub(r"\s+", " ", str(ln)).strip())
+    return lines
+
+
+def check_scheme_topology(spec_items: list[dict], scheme_files: list[dict]) -> dict[str, Any]:
+    """Топология схем подключения: пары «устройство → клемма/цепь» и целостность
+    цепей (наличие второго конца). Только по визуальным строкам схем; если пару
+    определить нельзя — помечается причиной, ничего не выдумывается."""
+    lines = _scheme_lines_of(scheme_files)
+    if not lines:
+        return _skip(
+            "Топология подключений не извлечена: на схемах нет распознанных строк "
+            "(нужен векторный PDF с листами схем либо DXF/DWG)."
+        )
+
+    # марки оборудования спецификации (для привязки «устройство» в строке)
+    spec_marks: dict[str, str] = {}
+    for i in spec_items:
+        if _is_cable_item(i):
+            continue
+        for k in ("mark", "type"):
+            v = str(i.get(k) or "").strip()
+            if v and len(v) >= 3:
+                spec_marks.setdefault(compact_mark(v), re.sub(r"\s+", " ", v))
+        # короткие типовые обозначения оборудования
+        name = str(i.get("name") or "").strip()
+        for m in re.findall(r"(?:С2000[\w./\-]*|МПН|УК-ВК[\w./\-]*|РИП[\w.\-]*|ШПС[\w.\-]*|БЗЛ|БКИ|КДЛ|БРШС[\w\-]*|QF\d+|SB\d+)", name, re.I):
+            spec_marks.setdefault(compact_mark(m), m)
+
+    pairs: list[str] = []
+    chain_counts: dict[str, int] = defaultdict(int)
+    subs_by_base: dict[str, set] = defaultdict(set)
+    cable_marks_on_scheme = 0
+    for ln in lines:
+        up = ln.upper()
+        # цепи и их базы (второй конец)
+        for tok in _CHAIN_RE.findall(up):
+            t = re.sub(r"\s+", "", tok)
+            chain_counts[t] += 1
+            base = re.sub(r"[.\-]\d+$", "", t)
+            if base != t:
+                subs_by_base[base].add(t)
+        # кабельные марки на схемах
+        if re.search(r"ВВГ|КПС|КСБГ|КСБК|КСВВ|КУНР|ПУГВ|UTP|FTP|NMF|ОКЛ", up):
+            cable_marks_on_scheme += 1
+        # пары устройство → клемма/цепь
+        devs = [spec_marks[c] for c in spec_marks if c in compact_mark(ln) and c]
+        terms = set(_TERM_RE.findall(ln))
+        chains = set(_CHAIN_RE.findall(ln))
+        if devs and (terms or chains):
+            d = devs[0]
+            targets = sorted({re.sub(r"\s+", "", t) for t in terms})[:2]
+            if not targets and chains:
+                targets = sorted({re.sub(r"\s+", "", t) for t in chains})[:2]
+            for tgt in targets:
+                pairs.append(f"{d} → {tgt}")
+
+    findings: list[dict] = []
+
+    # факты (info)
+    uniq_pairs: list[str] = []
+    for p in pairs:
+        if p not in uniq_pairs:
+            uniq_pairs.append(p)
+    findings.append(
+        finding(
+            "info",
+            "Топология подключений распознана",
+            f"Строк подключений: {len(lines)}; пар «устройство → клемма/цепь»: {len(uniq_pairs)}. "
+            + ("Примеры: " + "; ".join(uniq_pairs[:6]) + (", …" if len(uniq_pairs) > 6 else "") if uniq_pairs else "Пары не определены — проверить привязку вручную."),
+            ["ГОСТ 2.702-2011", "ГОСТ 2.709-2019"],
+            evidence=f"строк={len(lines)}, пар={len(uniq_pairs)}",
+        )
+    )
+
+    # целостность цепей: второй конец.
+    # Цепь считается полной, если: есть «базовый» токен (PS1.RS1) либо
+    # не менее двух суб-концов с общей базой (PS1.RS1.1 и PS1.RS1.2).
+    bare_tokens = {t for t in chain_counts if re.sub(r"[.\-]\d+$", "", t) == t}
+    dangling: list[str] = []
+    for base, subs in sorted(subs_by_base.items()):
+        if base in bare_tokens:
+            continue
+        if len(subs) >= 2:
+            continue
+        dangling.append(f"{sorted(subs)[0]} (нет второго конца {base})")
+    for b in sorted(bare_tokens):
+        if chain_counts.get(b, 0) == 1 and b not in subs_by_base:
+            dangling.append(f"{b} (встречается один раз)")
+    if dangling:
+        findings.append(
+            finding(
+                "noncritical",
+                "Цепи схем без второго конца",
+                "Следующие цепи/линии встречаются только с одной стороны: " + ", ".join(dangling[:15])
+                + ("…" if len(dangling) > 15 else "")
+                + ". Проверить, где их второй конец (возможно, в смежном комплекте документации).",
+                ["ГОСТ 2.702-2011"],
+                evidence=f"цепей без второго конца: {len(dangling)}",
+            )
+        )
+
+    if cable_marks_on_scheme == 0:
+        findings.append(
+            finding(
+                "info",
+                "Марки кабелей на схемах подключений не подписаны",
+                "В строках схем подключений не распознаны марки кабелей (ВВГ/КПС/КСБГ/UTP и т.п.). "
+                "Привязку «кабель → клемма» по схемам выполнить нельзя — сверяйте с кабельным журналом вручную.",
+                ["ГОСТ 2.702-2011"],
+            )
+        )
+
+    return {"status": "done", "reason": "", "findings": findings}
+
+
 # ---------- длины на планах ----------
 
 _SCALE_NOTE_RE = re.compile(r"\b(?:масштаб|м)\s*1\s*[:：]\s*(\d+)\b", re.I)

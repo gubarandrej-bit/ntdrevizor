@@ -538,6 +538,12 @@ def _extract_text_bounded(page: Any, timeout: float) -> str | None:
 
 _PLAN_PAGE_MARKERS = ("план расположен", "план прокладк", "план трасс")
 
+# Страницы схем: подключения, принципиальные, структурные, электрические, функциональные.
+_SCHEME_PAGE_MARKERS = (
+    "схемы подключен", "схема подключен", "схема структурн",
+    "схема принципиальн", "схема электрич", "схема функциональн",
+)
+
 
 def _is_cable_color(c: Any) -> bool:
     """Цветная линия (красная/синяя/зелёная и т.п.) — признак трассы на CAD-плане.
@@ -902,6 +908,69 @@ _JOURNAL_PAGE_MARKERS = (
 def _is_journal_page(text: str) -> bool:
     low = (text or "").lower()
     return any(m in low for m in _JOURNAL_PAGE_MARKERS)
+
+
+_SCHEME_LINE_MAX = 1200  # защита от раздувания данных (строк подключений)
+
+
+def _extract_scheme_lines_pymupdf(path: Path, page_texts: dict[int, str]) -> tuple[list[str], list[str]]:
+    """Визуальные строки страниц схем (устройство/клемма/цепь) для топологии.
+
+    Собирает слова с координатами (PyMuPDF get_text("words")) на страницах
+    «Схемы подключений / принципиальные / структурные», группирует в
+    визуальные строки и оставляет только строки с признаками подключения
+    (клеммы, цепи, устройства, RS-485, ДПЛС). Возвращает (строки, notes).
+    """
+    try:
+        import pymupdf
+    except ImportError:
+        return [], ["PyMuPDF недоступен — топология схем не извлечена."]
+    _quiet_mupdf()
+    lines_out: list[str] = []
+    notes: list[str] = []
+    doc = pymupdf.open(str(path))
+    try:
+        for pn, ptext in page_texts.items():
+            low = ptext.lower()
+            if not any(m in low for m in _SCHEME_PAGE_MARKERS):
+                continue
+            if pn < 1 or pn > len(doc):
+                continue
+            try:
+                words = doc[pn - 1].get_text("words")
+            except Exception:
+                continue
+            for ln in _words_to_lines(words):
+                if len(lines_out) >= _SCHEME_LINE_MAX:
+                    break
+                s = re.sub(r"\s+", " ", ln).strip()
+                if len(s) < 4:
+                    continue
+                # строки подключения: клеммы/цепи/устройства/интерфейсы
+                if not _scheme_line_relevant(s):
+                    continue
+                lines_out.append(f"p{pn}: {s}")
+            if len(lines_out) >= _SCHEME_LINE_MAX:
+                break
+    finally:
+        doc.close()
+    if lines_out:
+        notes.append(f"Топология схем: {len(lines_out)} строк подключений распознано.")
+    return lines_out, notes
+
+
+def _scheme_line_relevant(s: str) -> bool:
+    """Строка похожа на строку подключения (клемма/цепь/устройство/интерфейс)."""
+    up = s.upper()
+    if re.search(r"\bXT\d", up) or re.search(r"\bХ[ТРSАWВ]\d", up):
+        return True
+    if re.search(r"\b(?:PS|CD|QS|QD)\d+(?:\.\d+)*", up):
+        return True
+    if re.search(r"RS-?\s?485|ДПЛС|RJ-?\s?45|ВЫХОД\s*\d|ВХОД\s*\d|GND|\b[AА]\s*GND\s*[BВ]|\b[AА]\s*[BВ]\s*GND", up):
+        return True
+    if any(m in up for m in ("С2000", "СИРИУС", "МПН", "УК-ВК", "РИП", "ШПС", "БЗЛ", "БКИ", "КДЛ", "БРШС")):
+        return True
+    return False
 
 
 _JOURNAL_HEADER_CELLS = (
@@ -1367,6 +1436,10 @@ def parse_pdf(path: Path) -> dict[str, Any]:
         journal_items, jn = _parse_journal_lines(page_texts)
         notes.extend(jn)
 
+    # 5) Топология подключений: визуальные строки страниц схем (устройство/клемма/цепь)
+    scheme_lines, sl_notes = _extract_scheme_lines_pymupdf(path, page_texts)
+    notes.extend(sl_notes)
+
     return _base(
         ok=True,
         kind="pdf",
@@ -1376,6 +1449,7 @@ def parse_pdf(path: Path) -> dict[str, Any]:
         cables=cables,
         lengths=lengths,
         journal=journal_items,
+        scheme_lines=scheme_lines,
         notes="; ".join(notes),
     )
 
@@ -1865,6 +1939,7 @@ def _base(**kwargs) -> dict[str, Any]:
         "lengths": [],
         "texts_geom": [],
         "journal": [],
+        "scheme_lines": [],
     }
     out.update(kwargs)
     if out.get("text"):
