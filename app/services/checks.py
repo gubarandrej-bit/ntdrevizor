@@ -2018,11 +2018,51 @@ def _opov_volt(i: dict) -> int | None:
     return None
 
 
-def check_equipment_compat(spec_items: list[dict]) -> dict[str, Any]:
+def _rip_load_facts(text: str) -> dict[str, Any]:
+    """Извлекает итоги нагрузки из таблицы токов («Итого … мА») и марку РИП.
+
+    Таблица вида «Наименование | Кол | Ток (Реж.„Дежур."), мА | Ток всего, мА |
+    Ток (Реж.„Пожар"), мА | Ток всего, мА | … Итого: 130». Обрабатываются только
+    страницы с заголовком «Реж. „Дежур."»; никаких значений не подставляется —
+    только то, что явно написано в тексте.
+    """
+    out: dict[str, Any] = {"found": False, "totals": [], "rip": None}
+    if not text:
+        return out
+    totals: list[float] = []
+    rip_mark: str | None = None
+    for seg in re.split(r"--- страница \d+ ---\n", text):
+        low = seg.lower()
+        # только листы таблиц токов: заголовок «Реж."Дежур."»
+        if not re.search(r"реж\W{0,12}дежур", low):
+            continue
+        if "ма" not in low and "мa" not in low:
+            continue
+        for m in re.finditer(r"итого", low):
+            tail = seg[m.end(): m.end() + 60]
+            for n in re.findall(r"\d+(?:[.,]\d+)?", tail)[:2]:
+                v = parse_float(n)
+                if v is not None:
+                    totals.append(v)
+        if rip_mark is None:
+            rm = re.search(r"рип[- ]?\d{1,2}\s*исп\.?\s*[\w\d\-]{0,8}", seg, re.I)
+            if rm:
+                rip_mark = re.sub(r"\s+", " ", rm.group(0)).strip(" .,-")
+    if totals:
+        out["found"] = True
+        out["totals"] = [round(v, 1) for v in totals]
+    if rip_mark:
+        out["rip"] = rip_mark
+    return out
+
+
+def check_equipment_compat(spec_items: list[dict], text: str = "") -> dict[str, Any]:
     """Совместимость оборудования спецификации: протоколы (адресность),
     искробезопасные цепи, напряжения (АКБ↔РИП, оповещатели↔источник),
-    экосистема производителя. Только по фактам из спецификации; если пару
-    определить нельзя — помечается причиной, ничего не выдумывается."""
+    комплектность АКБ для источников 24 В, интерфейсы (RS-485/Ethernet/ДПЛС),
+    нагрузка РИП по таблице токов, экосистема производителя. Только по фактам
+    из спецификации/текста; если пару определить нельзя — помечается причиной,
+    ничего не выдумывается."""
     eq = [i for i in spec_items if i.get("qty") is not None and not _is_cable_item(i)]
     if not eq:
         return _skip("В спецификации нет позиций оборудования с количеством — совместимость проверять не с чем.")
@@ -2229,6 +2269,143 @@ def check_equipment_compat(spec_items: list[dict]) -> dict[str, Any]:
                 ["ГОСТ Р 53325-2012"],
             )
         )
+
+    # 7) комплектность АКБ: источник 24 В требует две АКБ по 12 В
+    src24 = [i for i in eq if _eq_volt(i) == 24]
+    bat12 = [i for i in bats if _bat_volt(i) == 12]
+    if src24 and bat12:
+        need = 2 * sum(int(i.get("qty") or 0) for i in src24)
+        have = sum(int(i.get("qty") or 0) for i in bat12)
+        if have < need:
+            findings.append(
+                finding(
+                    "noncritical",
+                    "Недостаточно АКБ 12 В для источников 24 В",
+                    f"Источники 24 В: {', '.join(_marks_of(src24))} (нужно 2×АКБ 12 В на каждый, т.е. {need} шт.), "
+                    f"в спецификации АКБ 12 В — {have} шт. Проверить комплектность и последовательное включение.",
+                    ["ГОСТ Р 53325-2012", "СП 6.13130.2025 прил. Б"],
+                    evidence=f"нужно={need}, в спецификации={have}",
+                )
+            )
+        else:
+            findings.append(
+                finding(
+                    "info",
+                    "Комплектность АКБ для источников 24 В соблюдена",
+                    f"Источники 24 В: {', '.join(_marks_of(src24))}; АКБ 12 В: {have} шт. — "
+                    f"достаточно для последовательного включения (по 2 на источник).",
+                    ["ГОСТ Р 53325-2012"],
+                    evidence=f"нужно={need}, в спецификации={have}",
+                )
+            )
+
+    # 8) интерфейсы: кабель ↔ устройства
+    iface = compat.get("interface_tokens") or {}
+    cable_items = [i for i in spec_items if _is_cable_item(i)]
+    cable_blob = norm(" ".join(
+        " ".join(str(i.get(k) or "") for k in ("name", "mark", "type", "manufacturer"))
+        for i in cable_items
+    ))
+    eq_blob = norm(" ".join(
+        " ".join(str(i.get(k) or "") for k in ("name", "mark", "type", "note"))
+        for i in eq
+    ))
+
+    def _has(tokens, blob):
+        return any(t in blob for t in tokens)
+
+    rs_cable = _has(iface.get("rs485_cable") or [], cable_blob)
+    rs_dev = _has(iface.get("rs485_device") or [], eq_blob)
+    eth_cable = _has(iface.get("eth_cable") or [], cable_blob)
+    eth_dev = _has(iface.get("eth_device") or [], eq_blob)
+    dpls_dev = _has(iface.get("dpls_device") or [], eq_blob)
+    two_wire = _has(iface.get("two_wire_cable") or [], cable_blob)
+
+    if rs_cable and rs_dev:
+        findings.append(finding("info", "Линия RS-485 обеспечена кабелем и устройствами",
+            "Есть кабель RS-485 (экранированная витая пара) и устройства с интерфейсом RS-485 — совместимо.",
+            ["ГОСТ 2.702-2011"]))
+    elif rs_cable and not rs_dev:
+        findings.append(finding("noncritical", "Кабель RS-485 без устройств с RS-485",
+            "В спецификации есть кабель RS-485, но устройств с этим интерфейсом не распознано. Проверить назначение кабеля.",
+            ["ГОСТ 2.702-2011"]))
+    elif rs_dev and not rs_cable:
+        findings.append(finding("noncritical", "Устройства RS-485 без кабеля RS-485",
+            "В спецификации есть устройства с RS-485, но кабеля RS-485 (экранированная витая пара, КСБГ/КСБК) не найдено.",
+            ["ГОСТ 2.702-2011"]))
+
+    if eth_cable and eth_dev:
+        findings.append(finding("info", "Линия Ethernet обеспечена кабелем и устройствами",
+            "Есть кабель Ethernet (витая пара SF/UTP и т.п.) и устройства с сетевым интерфейсом — совместимо.",
+            ["ГОСТ 2.702-2011"]))
+    elif eth_cable and not eth_dev:
+        findings.append(finding("noncritical", "Кабель Ethernet без сетевых устройств",
+            "В спецификации есть кабель Ethernet, но сетевых устройств (сервер/АРМ/коммутатор/камера) не распознано.",
+            ["ГОСТ 2.702-2011"]))
+    elif eth_dev and not eth_cable:
+        findings.append(finding("noncritical", "Сетевые устройства без кабеля Ethernet",
+            "В спецификации есть сетевые устройства, но кабеля Ethernet (витая пара) не найдено — "
+            "возможно, используется оптический кабель (ВОЛС). Проверить среду передачи.",
+            ["ГОСТ 2.702-2011"]))
+
+    if dpls_dev and not two_wire:
+        findings.append(finding("noncritical", "ДПЛС без двухпроводного кабеля",
+            "Есть контроллер/линия ДПЛС, но кабеля для двухпроводной линии связи (КПСЭнг… 1x2) не найдено.",
+            ["СП 484.1311500.2020"]))
+    elif dpls_dev and two_wire:
+        findings.append(finding("info", "ДПЛС обеспечена двухпроводным кабелем",
+            "Контроллер ДПЛС и двухпроводный кабель присутствуют — совместимо.",
+            ["СП 484.1311500.2020"]))
+
+    # 9) нагрузка РИП по таблице токов (дежурный/пожарный режим)
+    if text:
+        load = _rip_load_facts(text)
+        if load.get("found"):
+            totals = load["totals"]
+            rip_mark = load.get("rip") or "РИП"
+            rip_catalog = (compat.get("rip_catalog") or {}).get("models") or {}
+            key = norm(rip_mark)
+            known = None
+            for mk, val in rip_catalog.items():
+                if mk in key or key in mk:
+                    known = val
+                    break
+            if known is not None and totals:
+                over = [t for t in totals if t > known]
+                if over:
+                    findings.append(
+                        finding(
+                            "critical",
+                            "Нагрузка превышает номинал РИП",
+                            f"Итоги таблицы токов: {', '.join(f'{t:g} мА' for t in totals)}; номинал {rip_mark} = {known} мА. "
+                            "Превышение номинала недопустимо — нужен более мощный источник или пересчёт нагрузки.",
+                            ["СП 6.13130.2025 прил. Б", "ГОСТ Р 53325-2012"],
+                            evidence=f"итого={totals}, номинал={known}",
+                        )
+                    )
+                else:
+                    findings.append(
+                        finding(
+                            "info",
+                            "Нагрузка в пределах номинала РИП",
+                            f"Итоги таблицы токов: {', '.join(f'{t:g} мА' for t in totals)}; номинал {rip_mark} = {known} мА.",
+                            ["СП 6.13130.2025 прил. Б"],
+                            evidence=f"итого={totals}, номинал={known}",
+                        )
+                    )
+            else:
+                shown = ", ".join(f"{t:g}" for t in totals[:8]) + ("…" if len(totals) > 8 else "")
+                findings.append(
+                    finding(
+                        "info",
+                        "Таблица токов найдена, номинал РИП не внесён в каталог",
+                        f"Итоги нагрузки из таблиц токов (дежурный/пожарный режимы, мА): {shown or 'не извлечены'}. "
+                        f"Номинал «{rip_mark}» в каталоге отсутствует — проверка на превышение не выполнялась "
+                        "(значение не выдумывается); сверьте с паспортом источника.",
+                        ["СП 6.13130.2025 прил. Б", "ГОСТ Р 53325-2012"],
+                        evidence=f"итого={totals}, rip={rip_mark}",
+                    )
+                )
 
     if not findings:
         return {

@@ -356,7 +356,7 @@ def _run(db: Session, audit: Audit, talk: Callable) -> None:
     _announce(talk, "SPZ_POWER_CATEGORY", r)
 
     talk("Совместимость оборудования (протоколы, напряжение, искробезопасность)…")
-    r = check_equipment_compat(spec_items)
+    r = check_equipment_compat(spec_items, calc_text)
     _store(db, audit, "EQUIP_COMPAT", r["status"], r.get("reason", ""), r.get("findings", []))
     _announce(talk, "EQUIP_COMPAT", r)
 
