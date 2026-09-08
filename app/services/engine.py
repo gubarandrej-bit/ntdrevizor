@@ -29,6 +29,7 @@ from app.services.checks import (
     check_protection,
     check_redundancy,
     check_scheme_vs_spec,
+    scheme_facts,
     check_spec_journal_names,
     check_spec_journal_qty,
     check_spec_journal_section,
@@ -386,14 +387,19 @@ def _run(db: Session, audit: Audit, talk: Callable) -> None:
         for p in subset:
             ext = p.get("extracted") or {}
             if ext.get("ok") and ext.get("text"):
-                texts.append(f"### {p['filename']}\n{truncate(ext['text'], 6000)}")
+                texts.append(f"### {p['filename']}\n{_per_page_text(ext['text'])}")
             else:
                 texts.append(f"### {p['filename']}\nНЕ РАЗОБРАН: {ext.get('error') or p.get('parse_notes')}")
         if all("НЕ РАЗОБРАН" in t and len(t) < 400 for t in texts):
             _store(db, audit, code, "skipped", "Файлы не разобраны, текст для модели отсутствует.", [])
             talk("  не проводилась: файлы не разобраны.")
             continue
-        prompt = _ai_prompt(audit, systems, title, kind, "\n\n".join(texts), ntd_ctx)
+        # структурированная выжимка (обозначения, RS-485, ссылки) — модель
+        # сверяет по фактам, а не «плавает» по потоку слов
+        facts = scheme_facts(subset)
+        payload = ("Извлечённые факты (обозначения/линии/ссылки):\n" + (facts or "—") + "\n\n"
+                   + "Текст по листам:\n" + "\n\n".join(texts))
+        prompt = _ai_prompt(audit, systems, title, kind, payload, ntd_ctx)
         result = ai_svc.complete(model_id, prompt)
         if not result.get("ok"):
             _store(db, audit, code, "skipped", f"Модель не ответила: {result.get('error')}", [])
@@ -545,6 +551,33 @@ _PLAN_PAGE_MARKERS = (
 def _text_has_any(text: str, markers: tuple[str, ...]) -> bool:
     low = (text or "").lower()
     return any(m in low for m in markers)
+
+
+_PAGE_SPLIT_RE = re.compile(r"(?=--- страница \d+ ---\n)")
+
+
+def _per_page_text(text: str, budget: int = 26000) -> str:
+    """Режет текст документа по листам (вместо обрезки «по символам»).
+
+    Модель получает целые листы, а не оборванный кусок середины файла.
+    Ограничение — суммарный бюджет на файл: листы добавляются целиком,
+    пока влезают; последний неполный лист помечается.
+    """
+    blocks = [b for b in _PAGE_SPLIT_RE.split(text or "") if b.strip()]
+    if not blocks:
+        return truncate(text or "", budget)
+    out: list[str] = []
+    total = 0
+    for b in blocks:
+        if total + len(b) > budget:
+            if total == 0:
+                out.append(truncate(b, budget))
+            else:
+                out.append("…[остальные листы не вошли в окно контекста]…")
+            break
+        out.append(b.strip())
+        total += len(b)
+    return "\n\n".join(out)
 
 
 def _slice_pages(extracted: dict, markers: tuple[str, ...]) -> dict:

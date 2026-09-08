@@ -553,6 +553,100 @@ EQUIP_TOKEN_RE = re.compile(
     r"\s*-?\s*\d+[A-Za-zА-Яа-я0-9.\-]*\b"
 )
 
+# Обозначения с префиксом устройства по ГОСТ 2.710: «-U1», «-A2», «-KM1».
+# Дефис может быть отдельным текстовым объектом (в CAD-экспортах — на своей
+# строке), поэтому допускаем пробелы/перевод строки после «-».
+PREFIXED_TOKEN_RE = re.compile(
+    r"(?<![\w-])-\s*[A-ZА-Я]{1,2}\s*\d+(?:[.\-]\d+)*\b",
+    re.UNICODE,
+)
+
+# Кириллические разъёмы/клеммы по ГОСТ 2.710 (ХР — розетка, ХТ — клемма,
+# ХS/ХА — соединитель/колодка, ХW/ХВ — вилка/ввод).
+CYR_TOKEN_RE = re.compile(r"\b(?:ХР|ХТ|ХS|ХА|ХW|ХВ)\s*\d+\b")
+
+# Проектные обозначения цепей/шкафов/листов вида «PS2.2.SC6», «PS2.RU6»,
+# «ШПС2.1». Это не обязательно позиции спецификации — помечаем отдельно.
+DOTTED_TOKEN_RE = re.compile(r"\b[A-ZА-Я]{1,3}\d+(?:[.\-][A-ZА-Я]{0,3}\d+){1,3}\b")
+
+# Перекрёстные ссылки: «см. ГРК-177-2020-060-АОВ», «см. лист 4».
+XREF_RE = re.compile(
+    r"\bсм\.\s*(?:лист(?:а|у|е)?\s*)?([A-ZА-Я]{1,6}[-. ]?\d[\w.\-/А-Яа-я]*|\d+[\w./\-А-Яа-я]*)",
+    re.I,
+)
+
+# Линия RS-485 и её полярности (A/B/GND).
+RS485_RE = re.compile(r"rs-?\s?485", re.I)
+
+
+def _all_designation_tokens(text: str) -> set[str]:
+    """Все распознанные обозначения устройств/клемм/цепей на схемах."""
+    toks = set(EQUIP_TOKEN_RE.findall(text or ""))
+    toks.update(PREFIXED_TOKEN_RE.findall(text or ""))
+    toks.update(CYR_TOKEN_RE.findall(text or ""))
+    toks.update(DOTTED_TOKEN_RE.findall(text or ""))
+    return {re.sub(r"\s+", "", t).lstrip("-") for t in toks if t}
+
+
+def _equipment_tokens(text: str) -> set[str]:
+    """Обозначения оборудования/клемм (без цепей DOTTED) — то, что обязано
+    быть в спецификации. Ссылки на документы («- СП 484…», «- ТУ …») и
+    шифры листов отсеиваются."""
+    toks = set(EQUIP_TOKEN_RE.findall(text or ""))
+    toks.update(PREFIXED_TOKEN_RE.findall(text or ""))
+    toks.update(CYR_TOKEN_RE.findall(text or ""))
+    cleaned = set()
+    for t in toks:
+        c = re.sub(r"\s+", "", t).lstrip("-")
+        if not c:
+            continue
+        up = c.upper()
+        if up.startswith(("СП", "ТУ", "ГОСТ", "НПБ", "СПДС")):
+            continue
+        cleaned.add(c)
+    return cleaned
+
+
+def _scheme_text_facts(text: str) -> list[str]:
+    """Структурированные факты из текста схемы (для ИИ и детерминированных проверок).
+
+    Возвращает краткие строки: обозначения, линии RS-485, перекрёстные ссылки,
+    указания напряжения. Это «выжимка», которую модель получает вместе с текстом
+    листов — так проверка идёт по фактам, а не по потоку слов.
+    """
+    facts: list[str] = []
+    toks = sorted(_all_designation_tokens(text))
+    if toks:
+        facts.append(
+            "Обозначения устройств/клемм: " + ", ".join(toks[:80]) + (" …" if len(toks) > 80 else "")
+        )
+    low = (text or "").lower()
+    if RS485_RE.search(text or ""):
+        near = []
+        for m in RS485_RE.finditer(text or ""):
+            ctx = text[max(0, m.start() - 40): m.end() + 60].replace("\n", " ")
+            near.append(ctx.strip()[:90])
+        facts.append("Линии RS-485: " + " | ".join(dict.fromkeys(near))[:600])
+    xrefs = sorted(set(XREF_RE.findall(text or "")))
+    if xrefs:
+        facts.append("Перекрёстные ссылки (см. …): " + ", ".join(xrefs[:30]))
+    volts = sorted(set(re.findall(r"\b(?:24|12|220|48|36)\s*В(?:\b|,)", text or "")))
+    if volts:
+        facts.append("Указания напряжений: " + ", ".join(volts[:10]))
+    return facts
+
+
+def scheme_facts(scheme_files: list[dict]) -> str:
+    """Структурированная сводка по файлам схем (для промпта ИИ)."""
+    parts = []
+    for f in scheme_files:
+        ext = f.get("extracted") or {}
+        facts = _scheme_text_facts(ext.get("text") or "")
+        if facts:
+            parts.append(f"### {f.get('filename')}\n" + "\n".join(facts))
+    return "\n\n".join(parts)
+
+
 
 def _brand_no_section(i: dict) -> str:
     """Марка кабеля без сечения (для сопоставления типа по строкам)."""
@@ -680,9 +774,9 @@ def check_scheme_vs_spec(spec_items: list[dict], scheme_files: list[dict]) -> di
         geom_texts.extend(t.get("text", "") for t in ext.get("texts_geom") or [])
         blocks.extend(e.get("name", "") for e in ext.get("equipment") or [])
     blob = "\n".join([text, *geom_texts, *blocks])
-    tokens = set(EQUIP_TOKEN_RE.findall(blob))
-    # также текстовые наименования длиннее 4 символов
-    if not tokens and not blob.strip():
+    tokens = _equipment_tokens(blob)
+    circuit_tokens = set(DOTTED_TOKEN_RE.findall(blob))
+    if not tokens and not circuit_tokens and not blob.strip():
         return _skip("Из схем не извлечены текст и обозначения оборудования.")
 
     spec_blob = " ".join(
@@ -725,6 +819,67 @@ def check_scheme_vs_spec(spec_items: list[dict], scheme_files: list[dict]) -> di
                 ["ГОСТ 2.702-2011"],
             )
         )
+
+    # ---------- цепи/шкафы с проектными обозначениями ----------
+    if circuit_tokens:
+        findings.append(
+            finding(
+                "info",
+                "Цепи и шкафы с проектными обозначениями",
+                "На схемах распознано цепей/шкафов/линий с проектными обозначениями: "
+                + ", ".join(sorted(circuit_tokens)[:30])
+                + (", …" if len(circuit_tokens) > 30 else "")
+                + ". Это не позиции спецификации; проверить, что каждая цепь соответствует "
+                "кабелю журнала/спецификации (марка, сечение) и листу подключения.",
+                ["ГОСТ 2.709-2019"],
+                evidence=f"обозначений цепей: {len(circuit_tokens)}",
+            )
+        )
+
+    # ---------- перекрёстные ссылки ----------
+    xrefs = sorted(set(XREF_RE.findall(blob)))
+    if xrefs:
+        findings.append(
+            finding(
+                "info",
+                "Перекрёстные ссылки на другие документы/листы",
+                "На схемах есть ссылки: "
+                + ", ".join(f"«см. {x}»" for x in xrefs[:20])
+                + (", …" if len(xrefs) > 20 else "")
+                + ". Проверить наличие этих документов/листов в комплекте и сходимость обозначений.",
+                ["ГОСТ 2.701-2008"],
+                evidence=f"ссылок: {len(xrefs)}",
+            )
+        )
+
+    # ---------- целостность линий RS-485 (полярность) ----------
+    if RS485_RE.search(blob):
+        low = blob.lower()
+        has_a = bool(re.search(r"rs-?485[^\n]{0,40}[\s(]a\b|[\s(]a\b[^\n]{0,40}rs-?485", blob, re.I))
+        has_b = bool(re.search(r"rs-?485[^\n]{0,40}[\s(]b\b|[\s(]b\b[^\n]{0,40}rs-?485", blob, re.I))
+        if has_a != has_b:
+            findings.append(
+                finding(
+                    "noncritical",
+                    "Линия RS-485: неполная полярность",
+                    "На схемах упоминается RS-485, но полярности A и B "
+                    + ("не обе указаны рядом с линией." if has_a or has_b else "не распознаны.")
+                    + " Для корректного подключения интерфейса должны быть обозначены оба провода (A/B) и общий (GND).",
+                    ["ГОСТ 2.702-2011"],
+                    evidence=f"A={'есть' if has_a else 'нет'}, B={'есть' if has_b else 'нет'}",
+                )
+            )
+        else:
+            findings.append(
+                finding(
+                    "info",
+                    "Линия RS-485",
+                    "На схемах распознаны линии RS-485 с полярностями A/B — "
+                    "проверить соответствие клеммам приборов и марке кабеля (экранированная витая пара).",
+                    ["ГОСТ 2.702-2011"],
+                    evidence=f"A={'есть' if has_a else 'нет'}, B={'есть' if has_b else 'нет'}",
+                )
+            )
     return {"status": "done", "reason": "", "findings": findings}
 
 
