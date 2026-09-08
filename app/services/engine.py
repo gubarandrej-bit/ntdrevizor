@@ -21,6 +21,7 @@ from app.services.checks import (
     check_cable_section,
     check_detector_spacing,
     check_completeness,
+    check_equipment_compat,
     check_laying,
     check_laying_params,
     check_outdated_ntd_refs,
@@ -353,6 +354,11 @@ def _run(db: Session, audit: Audit, talk: Callable) -> None:
     r = check_spz_category(full_text, systems)
     _store(db, audit, "SPZ_POWER_CATEGORY", r["status"], r.get("reason", ""), r.get("findings", []))
     _announce(talk, "SPZ_POWER_CATEGORY", r)
+
+    talk("Совместимость оборудования (протоколы, напряжение, искробезопасность)…")
+    r = check_equipment_compat(spec_items)
+    _store(db, audit, "EQUIP_COMPAT", r["status"], r.get("reason", ""), r.get("findings", []))
+    _announce(talk, "EQUIP_COMPAT", r)
 
     # ИИ-проверки
     model_id, why = ai_svc.pick_model(mode, models)

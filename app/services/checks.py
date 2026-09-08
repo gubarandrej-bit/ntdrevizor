@@ -1951,6 +1951,303 @@ def check_spz_category(text: str, systems: list[str]) -> dict[str, Any]:
     }
 
 
+# ---------- совместимость оборудования ----------
+
+def _eq_blob(i: dict) -> str:
+    return norm(" ".join(str(i.get(k) or "") for k in ("name", "mark", "type", "note")))
+
+
+def _eq_compact(i: dict) -> str:
+    return compact_mark(" ".join(str(i.get(k) or "") for k in ("name", "mark", "type", "note")))
+
+
+def _eq_has(i: dict, tokens: tuple[str, ...]) -> bool:
+    b = _eq_blob(i)
+    return any(t in b for t in tokens)
+
+
+def _mark_of(i: dict) -> str:
+    m = re.sub(r"\s+", " ", (i.get("mark") or i.get("type") or "").strip()).strip()
+    if m:
+        return m[:40]
+    return re.sub(r"\s+", " ", (i.get("name") or "").strip())[:40]
+
+
+def _marks_of(lst: list[dict], n: int = 5) -> list[str]:
+    """Уникальные марки позиций (без повторов) для компактного перечисления."""
+    out: list[str] = []
+    for i in lst:
+        m = _mark_of(i)
+        if m and m not in out:
+            out.append(m)
+        if len(out) >= n:
+            break
+    return out
+
+
+def _eq_volt(i: dict) -> int | None:
+    """Напряжение источника питания из марки: РИП-12, ШПС-24, ИВЭПР-24 и т.п."""
+    c = _eq_compact(i)
+    m = re.search(r"(?:рип|шпс|ивэпр|бп|скб|аир|апс)(\d{2})", c)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _bat_volt(i: dict) -> int | None:
+    """Напряжение АКБ из марки: «АБ 1217С» → 12 В, «12В» → 12 В."""
+    c = _eq_compact(i)
+    m = re.search(r"аб(\d{2})", c)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d{2})в(?:\b|$)", c)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _opov_volt(i: dict) -> int | None:
+    """Напряжение оповещателя из марки: КРИСТАЛЛ-24, Маяк-24-ЗМ1 → 24 В."""
+    b = _eq_blob(i)
+    if not any(t in b for t in ("оповещател", "маяк", "кристалл", "табло")):
+        return None
+    c = _eq_compact(i)
+    m = re.search(r"(?:кристалл|маяк|оповещател|табло)(\d{2})", c)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def check_equipment_compat(spec_items: list[dict]) -> dict[str, Any]:
+    """Совместимость оборудования спецификации: протоколы (адресность),
+    искробезопасные цепи, напряжения (АКБ↔РИП, оповещатели↔источник),
+    экосистема производителя. Только по фактам из спецификации; если пару
+    определить нельзя — помечается причиной, ничего не выдумывается."""
+    eq = [i for i in spec_items if i.get("qty") is not None and not _is_cable_item(i)]
+    if not eq:
+        return _skip("В спецификации нет позиций оборудования с количеством — совместимость проверять не с чем.")
+
+    compat = engineering_tables().get("equipment_compat") or {}
+    izv_tokens = ("извещател", "датчик", "дип-", "ипр-", "ип 212", "ип 535", "ипт-")
+    ex_device_tokens = tuple(compat.get("ex_device_tokens") or ())
+    ex_barrier_tokens = tuple(compat.get("ex_barrier_tokens") or ())
+    addr_tokens = tuple(compat.get("addr_tokens") or ())
+    nonaddr_tokens = tuple(compat.get("nonaddr_tokens") or ())
+    addr_panel_tokens = tuple(compat.get("addr_panel_tokens") or ())
+    eco_list = compat.get("ecosystems") or []
+
+    detectors = [i for i in eq if _eq_has(i, izv_tokens)]
+    ex_dev = [i for i in detectors if _eq_has(i, ex_device_tokens) and not _eq_has(i, ex_barrier_tokens)]
+    ex_barrier = [i for i in eq if _eq_has(i, ex_barrier_tokens)]
+    addr_ip = [i for i in detectors if _eq_has(i, addr_tokens) and not _eq_has(i, nonaddr_tokens)]
+    nonaddr_ip = [i for i in detectors if _eq_has(i, nonaddr_tokens)]
+    addr_panel = [i for i in eq if _eq_has(i, addr_panel_tokens)]
+    extenders = [i for i in eq if _eq_has(i, ("с2000-ар", "расширител"))]
+
+    rips = [i for i in eq if _eq_has(i, ("рип", "источник бесперебойн", "ибп", "резервн"))]
+    bats = [i for i in eq if _eq_has(i, ("акб", "аккумул", "батаре"))]
+    opov = [i for i in eq if _eq_has(i, ("оповещател", "маяк", "кристалл", "табло"))]
+
+    findings: list[dict] = []
+
+    def qty_of(lst: list[dict]) -> float:
+        return sum(float(i.get("qty") or 0) for i in lst)
+
+    # 1) искробезопасные цепи
+    if ex_dev:
+        if not ex_barrier:
+            findings.append(
+                finding(
+                    "critical",
+                    "Искробезопасные извещатели без барьеров искрозащиты",
+                    f"В спецификации есть искробезопасные устройства ({', '.join(_marks_of(ex_dev))}), "
+                    "но блок искробезопасных цепей/барьер (С2000-БРШС-Ex, барьер искрозащиты) не найден. "
+                    "Подключение искробезопасного извещателя без барьера во взрывоопасной зоне недопустимо.",
+                    ["ГОСТ 31610.11-2014 (IEC 60079-11)", "СП 484.1311500.2020"],
+                    evidence=f"искробезопасных устройств: {qty_of(ex_dev):g}; барьеров: 0",
+                )
+            )
+        else:
+            findings.append(
+                finding(
+                    "info",
+                    "Искробезопасные цепи обеспечены барьерами",
+                    f"Искробезопасные устройства ({', '.join(_marks_of(ex_dev))}) сопряжены с "
+                    f"барьерами ({', '.join(_marks_of(ex_barrier))}) — совместимо.",
+                    ["ГОСТ 31610.11-2014 (IEC 60079-11)"],
+                )
+            )
+
+    # 2) адресные извещатели ↔ адресный прибор
+    if addr_ip:
+        if not addr_panel:
+            findings.append(
+                finding(
+                    "critical",
+                    "Адресные извещатели без адресного прибора",
+                    f"В спецификации {qty_of(addr_ip):g} адресных извещателей "
+                    f"({', '.join(_marks_of(addr_ip))}), но адресный ППКП/контроллер "
+                    "(например, «Сириус», С2000-КДЛ) не найден. Адресные извещатели работают только с адресным прибором.",
+                    ["ГОСТ Р 53325-2012", "СП 484.1311500.2020"],
+                    evidence=f"адресных извещателей: {qty_of(addr_ip):g}",
+                )
+            )
+        else:
+            findings.append(
+                finding(
+                    "info",
+                    "Адресные извещатели имеют адресный прибор",
+                    f"Адресные извещатели ({', '.join(_marks_of(addr_ip))}) сопряжены с "
+                    f"адресным прибором ({', '.join(_marks_of(addr_panel))}) — совместимо.",
+                    ["СП 484.1311500.2020"],
+                )
+            )
+
+    # 3) неадресные извещатели — нужен расширитель/неадресный вход
+    if nonaddr_ip and not extenders:
+        findings.append(
+            finding(
+                "noncritical",
+                "Неадресные извещатели: вход подключения не найден",
+                f"В спецификации {qty_of(nonaddr_ip):g} неадресных извещателей, но расширители адресные "
+                "(С2000-АР1/АР2) не найдены. Проверить схему включения неадресных извещателей.",
+                ["СП 484.1311500.2020"],
+                evidence=f"неадресных извещателей: {qty_of(nonaddr_ip):g}",
+            )
+        )
+    elif nonaddr_ip:
+        findings.append(
+            finding(
+                "info",
+                "Неадресные извещатели подключены через расширители",
+                f"Неадресные извещатели ({', '.join(_marks_of(nonaddr_ip))}) и "
+                f"расширители ({', '.join(_marks_of(extenders))}) — совместимо.",
+                ["СП 484.1311500.2020"],
+            )
+        )
+
+    # 4) напряжение АКБ ↔ РИП/ИБП
+    if rips and bats:
+        rip_volts = {v for v in (_eq_volt(i) for i in rips) if v}
+        bat_volts = {v for v in (_bat_volt(i) for i in bats) if v}
+        if rip_volts and bat_volts:
+            if 24 in rip_volts and 24 not in bat_volts and 12 in bat_volts:
+                findings.append(
+                    finding(
+                        "noncritical",
+                        "РИП 24 В с АКБ 12 В",
+                        "В спецификации источник 24 В, а АКБ — только 12 В. Для питания 24 В требуются "
+                        "две АКБ по 12 В последовательно (или АКБ 24 В). Проверить комплектность и схему включения.",
+                        ["ГОСТ Р 53325-2012", "СП 6.13130.2025 прил. Б"],
+                        evidence=f"источники: {sorted(rip_volts)} В; АКБ: {sorted(bat_volts)} В",
+                    )
+                )
+            elif rip_volts & bat_volts:
+                findings.append(
+                    finding(
+                        "info",
+                        "Напряжение АКБ соответствует источнику",
+                        f"Источники ({', '.join(_marks_of(rips))}) и АКБ "
+                        f"({', '.join(_marks_of(bats))}) — {sorted(rip_volts & bat_volts)} В, совместимо.",
+                        ["ГОСТ Р 53325-2012"],
+                    )
+                )
+            else:
+                findings.append(
+                    finding(
+                        "noncritical",
+                        "Напряжение АКБ и источника не согласовано",
+                        f"Источники {sorted(rip_volts)} В, АКБ {sorted(bat_volts)} В — совпадения нет. "
+                        "Проверить напряжение питания приборов и АКБ.",
+                        ["ГОСТ Р 53325-2012"],
+                        evidence=f"источники: {sorted(rip_volts)} В; АКБ: {sorted(bat_volts)} В",
+                    )
+                )
+        else:
+            findings.append(
+                finding(
+                    "info",
+                    "Напряжение АКБ/источника из марок не определено",
+                    "В спецификации есть РИП/ИБП и АКБ, но напряжение из марок не извлечено. Проверить совместимость вручную.",
+                    ["ГОСТ Р 53325-2012"],
+                )
+            )
+
+    # 5) напряжение оповещателей ↔ источник
+    opov_volts = {v for v in (_opov_volt(i) for i in opov) if v}
+    if opov_volts:
+        src_volts = {v for v in (_eq_volt(i) for i in eq) if v}
+        missing = [v for v in sorted(opov_volts) if v not in src_volts]
+        if missing:
+            findings.append(
+                finding(
+                    "noncritical",
+                    "Источник питания оповещателей не найден",
+                    f"Оповещатели {sorted(opov_volts)} В, но явного источника питания такого напряжения "
+                    f"в спецификации не найдено (найдены источники: {sorted(src_volts) or '—'}). Проверить схему питания оповещателей.",
+                    ["СП 3.13130.2026", "ГОСТ Р 53325-2012"],
+                    evidence=f"оповещатели: {sorted(opov_volts)} В; источники: {sorted(src_volts) or '—'} В",
+                )
+            )
+        else:
+            findings.append(
+                finding(
+                    "info",
+                    "Оповещатели обеспечены источником нужного напряжения",
+                    f"Оповещатели {sorted(opov_volts)} В, источник {sorted(src_volts)} В — совместимо.",
+                    ["СП 3.13130.2026"],
+                )
+            )
+
+    # 6) экосистема производителя
+    eco_map: dict[str, list[str]] = {}
+    for i in eq:
+        b = _eq_blob(i)
+        for e in eco_list:
+            if any(t in b for t in e.get("tokens") or []):
+                eco_map.setdefault(e["name"], []).append(_mark_of(i))
+                break
+    if len(eco_map) == 1:
+        name, marks = next(iter(eco_map.items()))
+        findings.append(
+            finding(
+                "info",
+                f"Оборудование одной линейки: {name}",
+                f"Распознано {len(marks)} позиций линейки «{name}» — протокольная совместимость подтверждена по составу. "
+                "Позиции без распознанной линейки не учитывались.",
+                ["ГОСТ Р 53325-2012"],
+                evidence=", ".join(marks[:10]) + ("…" if len(marks) > 10 else ""),
+            )
+        )
+    elif len(eco_map) > 1:
+        findings.append(
+            finding(
+                "noncritical",
+                "Оборудование разных линеек производителей",
+                "В спецификации позиции разных линеек: " + ", ".join(f"«{k}» ({len(v)} поз.)" for k, v in eco_map.items())
+                + ". Проверить протокольную совместимость и интерфейсы связи (шлюзы).",
+                ["ГОСТ Р 53325-2012"],
+            )
+        )
+
+    if not findings:
+        return {
+            "status": "done",
+            "reason": "",
+            "findings": [
+                finding(
+                    "info",
+                    "Детерминированные пары совместимости не найдены",
+                    "Состав оборудования спецификации не дал распознаваемых пар (адресные/неадресные извещатели, "
+                    "искробезопасные цепи, РИП-АКБ, оповещатели, известные линейки производителей). "
+                    "Совместимость требует ручной проверки.",
+                    ["ГОСТ Р 53325-2012"],
+                )
+            ],
+        }
+    return {"status": "done", "reason": "", "findings": findings}
+
+
 def check_outdated_ntd_refs(text: str, hits: list[dict]) -> dict[str, Any]:
     findings = []
     for h in hits:
