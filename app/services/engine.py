@@ -291,7 +291,7 @@ def _run(db: Session, audit: Audit, talk: Callable) -> None:
     _announce(talk, "CABLE_MARK", r)
 
     talk("Расстановка пожарных извещателей по СП 484…")
-    r = check_detector_spacing(spec_items, full_text)
+    r = check_detector_spacing(spec_items, full_text, systems)
     _store(db, audit, "DETECTOR_SPACING", r["status"], r.get("reason", ""), r.get("findings", []))
     _announce(talk, "DETECTOR_SPACING", r)
 

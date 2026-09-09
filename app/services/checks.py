@@ -1345,14 +1345,83 @@ def _detector_kind(i: dict) -> str:
     return "unknown"
 
 
-def check_detector_spacing(spec_items: list[dict], full_text: str) -> dict[str, Any]:
+_EXPL_STOP = {"стадия", "формат", "спс", "план", "разрез", "лист", "листов", "изм", "согласовано", "подп", "дата", "№док", "взам", "инв"}
+_EXPL_CAT_RE = re.compile(r"^(?:-|—|[А-ЯA-Z]{1,2}\d{0,2})$")
+
+
+def _parse_explication_rooms(text: str) -> list[dict]:
+    """Помещения из таблиц «Экспликация помещений» (номер | наименование | площадь).
+
+    В CAD-экспортах таблица разбирается по строкам текста: чистый номер →
+    наименование (одна или несколько строк) → площадь (число) → категория.
+    Шум планов (оси, размеры, номера без наименования) отсеивается. Дубли
+    (экспликация повторяется на нескольких листах) убираются.
+    """
+    rooms: list[dict] = []
+    for seg in re.split(r"(?=--- страница \d+ ---\n)", text or ""):
+        m = re.match(r"--- страница (\d+) ---\n", seg)
+        if not m:
+            continue
+        body = seg[m.end():]
+        if "экспликац" not in body.lower():
+            continue
+        lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+        start = next((i for i, ln in enumerate(lines) if re.fullmatch(r"\d{1,3}", ln)), None)
+        if start is None:
+            continue
+        i = start
+        while i < len(lines):
+            tok = lines[i]
+            if re.fullmatch(r"\d{1,3}", tok):
+                num = int(tok)
+                i += 1
+                name_parts: list[str] = []
+                while i < len(lines):
+                    t = lines[i]
+                    if re.fullmatch(r"\d{1,5}(?:[.,]\d{1,3})?", t):
+                        break
+                    if t.lower() in _EXPL_STOP:
+                        break
+                    name_parts.append(t)
+                    i += 1
+                if i >= len(lines) or not re.fullmatch(r"\d{1,5}(?:[.,]\d{1,3})?", lines[i]):
+                    break
+                area = parse_float(lines[i])
+                i += 1
+                cat = ""
+                if i < len(lines) and _EXPL_CAT_RE.match(lines[i]):
+                    cat = lines[i]
+                    i += 1
+                name = " ".join(name_parts)
+                if name and re.search(r"[А-Яа-яA-Za-z]{2,}", name) and area and 1 <= area <= 2000:
+                    rooms.append({"num": num, "name": name, "area": area, "cat": cat})
+            else:
+                if tok.lower() in _EXPL_STOP:
+                    break
+                i += 1
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for r in rooms:
+        k = (r["num"], r["name"], round(r["area"], 2))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(r)
+    return out
+
+
+def check_detector_spacing(spec_items: list[dict], full_text: str, systems: list[str] | None = None) -> dict[str, Any]:
     """Расстановка пожарных извещателей по СП 484.1311500.2020.
 
-    Считает извещатели по типам (информационно) и, если в тексте есть размерные
-    данные помещений (площади), сверяет требуемое минимальное число извещателей
-    с фактическим по табл. А.1/А.2. Без размерных данных проверка не проводится —
-    данные не выдумываются.
+    Считает извещатели по типам (информационно) и, если есть размерные данные
+    помещений (площади в тексте либо таблицы «Экспликация помещений»), сверяет
+    требуемое минимальное число дымовых извещателей с фактическим по табл. А.1.
+    Сверка по площади выполняется только для системы ПС (для СКУД/ОС «извещатели»
+    — охранные, не пожарные). Тепловые ИП не обязательны в каждом помещении —
+    по ним только сводка. Без размерных данных проверка не проводится — данные
+    не выдумываются.
     """
+    is_ps = not systems or "PS" in systems
     detectors = [i for i in spec_items if _is_detector(i) and _is_material_line(i)]
     if not detectors:
         return _skip("В спецификации не найдены пожарные извещатели.")
@@ -1378,29 +1447,94 @@ def check_detector_spacing(spec_items: list[dict], full_text: str) -> dict[str, 
         )
     ]
 
-    # размерные данные помещений: площади (м2/м²/кв.м) и высоты
-    areas = [parse_float(x) for x in re.findall(r"(\d+(?:[.,]\d+)?)\s*(?:м\s*2|м²|кв\.?\s*м)", full_text)]
-    areas = [a for a in areas if a and 1 < a < 100000]
     heights = [parse_float(x) for x in re.findall(r"[вВ]ысот[а-я]*\s*(?:помещ[а-я]*)?\s*[-—]?\s*(\d+(?:[.,]\d+)?)", full_text)]
     heights = [h for h in heights if h and 1 < h < 30]
+    h = max(heights) if heights else 3.0
 
+    rooms = _parse_explication_rooms(full_text)
+    if rooms:
+        smoke_norm = next((r for r in smoke_rows if float(r["height"].split()[1].replace(",", ".")) >= h), None)
+        smoke_area = float(smoke_norm["area_m2"]) if smoke_norm else 85.0
+        import math as _math
+
+        total_area = sum(float(r["area"]) for r in rooms)
+        have_smoke = kinds.get("smoke", 0) + kinds.get("unknown", 0)
+        need_smoke = sum(max(1, _math.ceil(r["area"] / smoke_area)) for r in rooms)
+        big = [r for r in rooms if _math.ceil(r["area"] / smoke_area) > 1]
+        findings.append(
+            finding(
+                "info",
+                "Помещения по экспликации",
+                f"Распознано {len(rooms)} помещений, суммарная площадь {total_area:.0f} м² "
+                f"(высота до {h:g} м). Требуется не менее {need_smoke} дымовых ИП "
+                f"(мин. 1 на помещение, табл. А.1)."
+                + (f" Помещения с более чем одним ИП: " + ", ".join(f"«{r['name']}» {r['area']:g} м²" for r in big) + "." if big else ""),
+                ["СП 484.1311500.2020 табл. А.1"],
+                evidence=f"rooms={len(rooms)}, area={total_area:.0f}, need={need_smoke}",
+            )
+        )
+        if is_ps and have_smoke > 0 and have_smoke < need_smoke:
+            findings.append(
+                finding(
+                    "critical",
+                    "Извещателей меньше требуемого по площади",
+                    f"По экспликации требуется не менее {need_smoke} дымовых ИП, в спецификации {have_smoke}. "
+                    f"Оценка по площади (мин. 1 ИП на помещение) и не заменяет план расстановки.",
+                    ["СП 484.1311500.2020 табл. А.1"],
+                    evidence=f"need={need_smoke}, have={have_smoke}",
+                )
+            )
+        elif is_ps and have_smoke > 0:
+            findings.append(
+                finding(
+                    "info",
+                    "Дымовых извещателей достаточно по площади",
+                    f"Требуется не менее {need_smoke} дымовых ИП, в спецификации {have_smoke}.",
+                    ["СП 484.1311500.2020 табл. А.1"],
+                    evidence=f"need={need_smoke}, have={have_smoke}",
+                )
+            )
+        elif not is_ps and have_smoke > 0:
+            findings.append(
+                finding(
+                    "info",
+                    "Сверка по площади не выполнялась (система не ПС)",
+                    "Извещатели найдены, но выбрана система, отличная от пожарной сигнализации. "
+                    "Для охранных извещателей норматив расстановки иной — сверка по СП 484 табл. А.1 не выполняется.",
+                    ["СП 484.1311500.2020"],
+                )
+            )
+        if kinds.get("heat", 0) > 0:
+            findings.append(
+                finding(
+                    "info",
+                    "Тепловые извещатели (сводка)",
+                    f"Тепловых ИП в спецификации: {kinds.get('heat', 0)} шт. Норматив их количества "
+                    "зависит от назначения помещений (техпроцессы, взрывоопасные зоны) и по площади "
+                    "всех помещений не нормируется — требуется проверка по проекту.",
+                    ["СП 484.1311500.2020 табл. А.2"],
+                )
+            )
+        return {"status": "done", "reason": "", "findings": findings}
+
+    # запасной путь: площади, выписанные прямо в тексте («… 250 м² …»)
+    areas = [parse_float(x) for x in re.findall(r"(\d+(?:[.,]\d+)?)\s*(?:м\s*2|м²|кв\.?\s*м)", full_text)]
+    areas = [a for a in areas if a and 1 < a < 100000]
     if not areas:
         return {
             "status": "skipped",
             "reason": (
-                "Нет размерных данных помещений (площадей в м²). "
-                "Расстановка извещателей по СП 484 табл. А.1/А.2 не проверяется — данные не выдумываются."
+                "Нет размерных данных помещений (ни таблиц «Экспликация помещений», "
+                "ни площадей в тексте). Расстановка извещателей по СП 484 табл. А.1/А.2 "
+                "не проверяется — данные не выдумываются."
             ),
             "findings": findings,
         }
 
-    h = max(heights) if heights else 3.0
     smoke_norm = next((r for r in smoke_rows if float(r["height"].split()[1].replace(",", ".")) >= h), None)
-    heat_norm = next((r for r in heat_rows if float(r["height"].split()[1].replace(",", ".")) >= h), None)
-
     total_area = sum(areas)
     have_smoke = kinds.get("smoke", 0) + kinds.get("unknown", 0)
-    if smoke_norm and have_smoke > 0:
+    if is_ps and smoke_norm and have_smoke > 0:
         need = total_area / float(smoke_norm["area_m2"])
         if have_smoke < need:
             findings.append(
@@ -1413,20 +1547,9 @@ def check_detector_spacing(spec_items: list[dict], full_text: str) -> dict[str, 
                     evidence=f"area={total_area:.0f}, need={need:.0f}, have={have_smoke}",
                 )
             )
-    if heat_norm and kinds.get("heat", 0) > 0:
-        need = total_area / float(heat_norm["area_m2"])
-        have = kinds.get("heat", 0)
-        if have < need:
-            findings.append(
-                finding(
-                    "critical",
-                    "Тепловых извещателей меньше требуемого по площади",
-                    f"Суммарная площадь {total_area:.0f} м², высота до {h:g} м → требуется не менее {need:.0f} тепловых ИП (табл. А.2), в спецификации {have}.",
-                    ["СП 484.1311500.2020 табл. А.2"],
-                    evidence=f"area={total_area:.0f}, need={need:.0f}, have={have}",
-                )
-            )
     return {"status": "done", "reason": "", "findings": findings}
+
+
 
 
 def _detector_label(kind: str) -> str:
