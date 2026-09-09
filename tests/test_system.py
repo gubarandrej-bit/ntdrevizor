@@ -150,7 +150,42 @@ def test_api():
     print("OK api+audit+export+users")
 
 
+def test_new_checks_synthetic():
+    """Синтетические кейсы новых проверок: совместимость, экспликация, топология."""
+    from app.services.checks import (
+        check_equipment_compat,
+        check_scheme_topology,
+        _parse_explication_rooms,
+    )
+
+    # совместимость: адресные ИП без адресного прибора → critical
+    items = [
+        {"pos": "1", "name": "Извещатель пожарный дымовой адресно-аналоговый", "mark": "ДИП-34А-04", "type": "", "qty": 10, "length": None, "note": "", "manufacturer": ""},
+        {"pos": "2", "name": "Извещатель пожарный тепловой искробезопасный", "mark": "ИПТ-Ех", "type": "", "qty": 4, "length": None, "note": "", "manufacturer": ""},
+        {"pos": "3", "name": "Кабель", "mark": "КСБГСнг(А)-FRLS 2x2x0,78", "type": "", "qty": 100, "length": 100, "note": "", "manufacturer": ""},
+    ]
+    r = check_equipment_compat(items, "")
+    titles = {f["title"] for f in r["findings"]}
+    assert_true(any("без адресного прибора" in t for t in titles), titles)
+    assert_true(any("без барьеров" in t for t in titles), titles)
+
+    # экспликация: синтетический текст с двумя помещениями
+    text = (
+        "--- страница 3 ---\nЭкспликация помещений\nНомер\nпоме-щения\nНаименование\nПлощадь, м2\nКат.\n"
+        "1\nПроходная\n4,45\n-\n2\nПомещение панелей\n168,08\nВ4\nСтадия\nЛист\n"
+    )
+    rooms = _parse_explication_rooms(text)
+    assert_true(len(rooms) == 2, rooms)
+    assert_true(rooms[1]["name"] == "Помещение панелей" and abs(rooms[1]["area"] - 168.08) < 1e-6, rooms)
+
+    # топология: нет строк схем → skipped с причиной
+    r = check_scheme_topology(items, [{"filename": "x.pdf", "extracted": {"scheme_lines": []}}])
+    assert_true(r["status"] == "skipped" and r["reason"], r)
+    print("OK new checks (compat/explication/topology)")
+
+
 if __name__ == "__main__":
     test_parsers_and_checks()
+    test_new_checks_synthetic()
     test_api()
     print("ВСЕ ПРОВЕРКИ РЕПОЗИТОРИЯ ПРОЙДЕНЫ")
