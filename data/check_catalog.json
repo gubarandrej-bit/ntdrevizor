@@ -303,6 +303,16 @@
         "scheme_or_connections"
       ],
       "ai": false
+    },
+    {
+      "code": "PLAN_VS_SPEC_DEVICES",
+      "title": "Счёт устройств на планах по обозначениям ↔ спецификация",
+      "group": "сверки",
+      "requires": [
+        "specification",
+        "plan"
+      ],
+      "ai": false
     }
   ]
 }

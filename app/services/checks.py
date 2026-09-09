@@ -924,6 +924,8 @@ def check_scheme_topology(spec_items: list[dict], scheme_files: list[dict]) -> d
             spec_marks.setdefault(compact_mark(m), m)
 
     pairs: list[str] = []
+    term_circuit: dict[str, set] = defaultdict(set)
+    circuit_lines: dict[str, int] = defaultdict(int)
     chain_counts: dict[str, int] = defaultdict(int)
     subs_by_base: dict[str, set] = defaultdict(set)
     cable_marks_on_scheme = 0
@@ -936,6 +938,17 @@ def check_scheme_topology(spec_items: list[dict], scheme_files: list[dict]) -> d
             base = re.sub(r"[.\-]\d+$", "", t)
             if base != t:
                 subs_by_base[base].add(t)
+        # клемма ↔ цепь (на одной визуальной строке)
+        terms_in_line = set(_TERM_RE.findall(ln))
+        chains_in_line = set(re.sub(r"\s+", "", t) for t in _CHAIN_RE.findall(ln))
+        if terms_in_line and chains_in_line:
+            for c in chains_in_line:
+                circuit_lines[c] += 1
+                for t in terms_in_line:
+                    term_circuit[t].add(c)
+        else:
+            for c in chains_in_line:
+                circuit_lines[c] += 1
         # кабельные марки на схемах
         if re.search(r"ВВГ|КПС|КСБГ|КСБК|КСВВ|КУНР|ПУГВ|UTP|FTP|NMF|ОКЛ", up):
             cable_marks_on_scheme += 1
@@ -969,6 +982,24 @@ def check_scheme_topology(spec_items: list[dict], scheme_files: list[dict]) -> d
         )
     )
 
+    # назначения клемма → цепь (из одной визуальной строки)
+    if term_circuit:
+        tc_pairs: list[str] = []
+        for t in sorted(term_circuit):
+            for c in sorted(term_circuit[t])[:2]:
+                tc_pairs.append(f"{t}→{c}")
+        findings.append(
+            finding(
+                "info",
+                "Назначения клемма → цепь распознаны",
+                f"Распознано {len(tc_pairs)} назначений клемм на цепи "
+                + ("(примеры: " + "; ".join(tc_pairs[:6]) + (", …" if len(tc_pairs) > 6 else "") + ")" if tc_pairs else "")
+                + ". Это привязка контакта клеммы к конкретной цепи подключения.",
+                ["ГОСТ 2.702-2011", "ГОСТ 2.709-2019"],
+                evidence=f"назначений={len(tc_pairs)}",
+            )
+        )
+
     # целостность цепей: второй конец.
     # Цепь считается полной, если: есть «базовый» токен (PS1.RS1) либо
     # не менее двух суб-концов с общей базой (PS1.RS1.1 и PS1.RS1.2).
@@ -983,6 +1014,10 @@ def check_scheme_topology(spec_items: list[dict], scheme_files: list[dict]) -> d
     for b in sorted(bare_tokens):
         if chain_counts.get(b, 0) == 1 and b not in subs_by_base:
             dangling.append(f"{b} (встречается один раз)")
+    # цепи, встречающиеся ровно на одной строке без второго упоминания
+    for c, n in sorted(circuit_lines.items()):
+        if n == 1 and c not in dangling and not any(c in d for d in dangling):
+            dangling.append(f"{c} (одна строка — второй конец не подтверждён)")
     if dangling:
         findings.append(
             finding(
@@ -1560,6 +1595,136 @@ def _detector_label(kind: str) -> str:
         "combined": "комбинированные",
         "unknown": "тип не определён",
     }.get(kind, kind)
+
+
+# ---------- счёт устройств на планах по обозначениям ----------
+
+# Спецификация → тип обозначения по легенде (стр. 7): какой код плана
+# соответствует каким позициям спецификации.
+_SPEC_TO_DESIGN = {
+    "smoke": "BTH",       # дымовой ДИП-34А-04
+    "manual": "BTM",      # ручной ИПР-513-3АМ / ИП 535-26
+    "heat": "BTK",        # тепловой ИПТ-Ех
+    "light_ann": "BIAL",  # световой оповещатель
+    "sound_ann": "BIAS",  # звуковой оповещатель
+}
+_DESIGN_LABEL = {
+    "BTH": "дымовые извещатели",
+    "BTM": "ручные извещатели",
+    "BTK": "тепловые извещатели",
+    "BIAL": "световые оповещатели",
+    "BIAS": "звуковые оповещатели",
+}
+
+
+def _plan_designation_counts(text: str) -> dict[str, int]:
+    """Уникальные обозначения устройств на планах по типам легенды.
+
+    Примеры: PS1.BTH1, PS2.BTM4, PS4.BIAL2. Считаем уникальные пары
+    (тип, номер) — каждое устройство размечено один раз на своём листе.
+    """
+    counts: dict[str, set] = defaultdict(set)
+    for m in re.finditer(r"\bPS\d+\.([A-Z]{2,5})(\d+)\b", text or ""):
+        code, num = m.group(1), m.group(2)
+        if code in _DESIGN_LABEL:
+            counts[code].add(num)
+    return {k: len(v) for k, v in counts.items()}
+
+
+def _spec_design_totals(spec_items: list[dict]) -> dict[str, int]:
+    """Количество позиций спецификации в разрезе типов легенды планов."""
+    totals: dict[str, int] = defaultdict(int)
+    for i in spec_items:
+        if _is_cable_item(i) or not _is_material_line(i):
+            continue
+        blob = norm(" ".join(str(i.get(k) or "") for k in ("name", "mark", "type")))
+        q = int(i.get("qty") or 0)
+        if not q:
+            continue
+        kind = _detector_kind(i)
+        if "оповещател" in blob or "маяк" in blob or "кристалл" in blob or "табло" in blob:
+            # световой «ВЫХОД» vs звуковой
+            if "звуков" in blob or "маяк" in blob:
+                totals["BIAS"] += q
+            else:
+                totals["BIAL"] += q
+            continue
+        if kind in ("smoke", "heat", "manual"):
+            totals[_SPEC_TO_DESIGN[kind]] += q
+    return dict(totals)
+
+
+def check_plan_device_counts(spec_items: list[dict], plan_files: list[dict]) -> dict[str, Any]:
+    """Счёт устройств на планах по буквенным обозначениям ↔ спецификация.
+
+    На планах извещатели/оповещатели размечены обозначениями (PS1.BTH1 …),
+    расшифровка — лист «Условные обозначения». Сверяем уникальные обозначения
+    каждого типа с количеством в спецификации. Замечание — только если на
+    планах устройств БОЛЬШЕ, чем в спецификации (явное противоречие); меньше —
+    пометка о возможном неполном комплекте листов (например, PDF «Изм.» с
+    изменёнными листами). Ничего не выдумывается.
+    """
+    texts = [f.get("extracted") or {} for f in plan_files]
+    plan_text = "\n".join(str(t.get("text") or "") for t in texts)
+    plan_counts = _plan_designation_counts(plan_text)
+    if not plan_counts:
+        return _skip(
+            "На планах не распознаны обозначения устройств (PS*.BTH*/BTM*/BIAL*…). "
+            "Счёт по планам не выполняется — данных нет."
+        )
+    spec_totals = _spec_design_totals(spec_items)
+
+    findings = []
+    for code in sorted(set(plan_counts) | set(spec_totals)):
+        on_plan = plan_counts.get(code, 0)
+        in_spec = spec_totals.get(code, 0)
+        label = _DESIGN_LABEL.get(code, code)
+        if in_spec == 0:
+            findings.append(
+                finding(
+                    "info",
+                    f"На планах размечены «{label}», в спецификации не найдены",
+                    f"Обозначения {code} встречаются на планах ({on_plan} шт.), но в спецификации "
+                    "соответствующих позиций не найдено. Проверить комплектность спецификации.",
+                    ["ГОСТ 21.110-2013"],
+                    evidence=f"plan={on_plan}, spec=0",
+                )
+            )
+            continue
+        if on_plan > in_spec:
+            findings.append(
+                finding(
+                    "noncritical",
+                    f"На планах «{label}» больше, чем в спецификации",
+                    f"На планах размечено {on_plan}, в спецификации {in_spec}. Расхождение требует "
+                    "проверки: устройство на плане должно иметь позицию в спецификации.",
+                    ["ГОСТ 21.110-2013", "ГОСТ 21.613-2014"],
+                    evidence=f"plan={on_plan}, spec={in_spec}",
+                )
+            )
+        elif on_plan < in_spec:
+            findings.append(
+                finding(
+                    "info",
+                    f"На планах «{label}» меньше, чем в спецификации",
+                    f"На планах размечено {on_plan}, в спецификации {in_spec}. Возможно, загружен "
+                    "неполный комплект листов планов (изменённые листы «Изм.») либо часть устройств "
+                    "находится на незагруженных листах. Проверить комплектность планов.",
+                    ["ГОСТ 21.110-2013"],
+                    evidence=f"plan={on_plan}, spec={in_spec}",
+                )
+            )
+        else:
+            findings.append(
+                finding(
+                    "info",
+                    f"«{label}»: планы и спецификация сходятся",
+                    f"На планах размечено {on_plan}, в спецификации {in_spec} — совпадает.",
+                    ["ГОСТ 21.110-2013"],
+                    evidence=f"plan={on_plan}, spec={in_spec}",
+                )
+            )
+    return {"status": "done", "reason": "", "findings": findings}
 
 
 # ---------- зоны контроля и отказоустойчивость (СП 484 Изм. № 1) ----------
@@ -2628,7 +2793,9 @@ def check_equipment_compat(spec_items: list[dict], text: str = "") -> dict[str, 
                             "critical",
                             "Нагрузка превышает номинал РИП",
                             f"Итоги таблицы токов: {', '.join(f'{t:g} мА' for t in totals)}; номинал {rip_mark} = {known} мА. "
-                            "Превышение номинала недопустимо — нужен более мощный источник или пересчёт нагрузки.",
+                            "Хотя бы один режим (дежурный/тревожный) превышает номинальный ток источника. "
+                            "Кратковременный максимум источника здесь не зачитывается — проверьте по паспорту, "
+                            "допустима ли такая нагрузка, либо пересчитайте/замените источник.",
                             ["СП 6.13130.2025 прил. Б", "ГОСТ Р 53325-2012"],
                             evidence=f"итого={totals}, номинал={known}",
                         )

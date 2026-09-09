@@ -25,6 +25,7 @@ from app.services.checks import (
     check_laying,
     check_laying_params,
     check_outdated_ntd_refs,
+    check_plan_device_counts,
     check_plan_lengths,
     check_power_source,
     check_protection,
@@ -282,6 +283,11 @@ def _run(db: Session, audit: Audit, talk: Callable) -> None:
     r = check_plan_lengths(journal_items, plan_files, tol_len)
     _store(db, audit, "PLAN_LENGTH_VS_JOURNAL", r["status"], r.get("reason", ""), r.get("findings", []))
     _announce(talk, "PLAN_LENGTH_VS_JOURNAL", r)
+
+    talk("Счёт устройств на планах по обозначениям ↔ спецификация…")
+    r = check_plan_device_counts(spec_items, plan_files)
+    _store(db, audit, "PLAN_VS_SPEC_DEVICES", r["status"], r.get("reason", ""), r.get("findings", []))
+    _announce(talk, "PLAN_VS_SPEC_DEVICES", r)
 
     talk("Проверка марок кабелей…")
     r = check_cable_mark(all_cables, systems, full_text)

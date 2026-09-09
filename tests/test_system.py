@@ -151,11 +151,13 @@ def test_api():
 
 
 def test_new_checks_synthetic():
-    """Синтетические кейсы новых проверок: совместимость, экспликация, топология."""
+    """Синтетические кейсы новых проверок: совместимость, экспликация, топология, счёт устройств, нагрузка РИП."""
     from app.services.checks import (
         check_equipment_compat,
         check_scheme_topology,
+        check_plan_device_counts,
         _parse_explication_rooms,
+        _rip_load_facts,
     )
 
     # совместимость: адресные ИП без адресного прибора → critical
@@ -181,7 +183,34 @@ def test_new_checks_synthetic():
     # топология: нет строк схем → skipped с причиной
     r = check_scheme_topology(items, [{"filename": "x.pdf", "extracted": {"scheme_lines": []}}])
     assert_true(r["status"] == "skipped" and r["reason"], r)
-    print("OK new checks (compat/explication/topology)")
+
+    # счёт устройств на планах: обозначения PS*.BTH* (дымовые) vs спецификация
+    plan_files = [{"filename": "p.pdf", "extracted": {
+        "text": "--- страница 10 ---\nПлан\nPS1.BTH1 PS1.BTH2 PS1.BTH3\nPS2.BTM1\n"
+    }}]
+    spec = [
+        {"pos": "1", "name": "Извещатель пожарный дымовой адресно-аналоговый", "mark": "ДИП-34А-04", "type": "", "qty": 5, "length": None, "note": "", "manufacturer": ""},
+        {"pos": "2", "name": "Извещатель пожарный ручной", "mark": "ИПР-513-3АМ", "type": "", "qty": 2, "length": None, "note": "", "manufacturer": ""},
+    ]
+    r = check_plan_device_counts(spec, plan_files)
+    assert_true(r["status"] == "done", r)
+    titles = {f["title"] for f in r["findings"]}
+    assert_true(any("дымовые" in t and "меньше" in t for t in titles), titles)
+
+    # нагрузка РИП: таблица токов + номинал из каталога
+    load_text = (
+        "--- страница 5 ---\nТаблица токов Реж. Дежур., мА Реж. Пожар, мА\n"
+        "Прибор 60 60 120 120.0 Итого: 770.0 1110.0\nРИП-12 исп.20\n"
+    )
+    facts = _rip_load_facts(load_text)
+    assert_true(facts["found"] and facts["rip"] == "РИП-12 исп.20", facts)
+    r = check_equipment_compat(
+        [{"pos": "1", "name": "Источник", "mark": "РИП-12 исп.20", "type": "", "qty": 1, "length": None, "note": "", "manufacturer": ""}],
+        load_text,
+    )
+    titles = {f["title"] for f in r["findings"]}
+    assert_true(any("превышает номинал" in t for t in titles), titles)
+    print("OK new checks (compat/explication/topology/plan-count/rip-load)")
 
 
 if __name__ == "__main__":
