@@ -885,7 +885,7 @@ def check_scheme_vs_spec(spec_items: list[dict], scheme_files: list[dict]) -> di
 
 # ---------- топология подключений (схемы) ----------
 
-_CHAIN_RE = re.compile(r"\b(?:PS|CD|QS|QD)\d+(?:[.\-][A-ZА-Я]{0,4}\d+)*\b")
+_CHAIN_RE = re.compile(r"\b(?:PS|CD|QS|QD)\d+(?:(?:[.\-][A-ZА-Я]{1,4}\d*)|(?:[.\-]\d+))*\b")
 _TERM_RE = re.compile(r"\bXT\d+(?:\.\d+)?\b|\bХ[ТРSАWВ]\d+\b|\bХР\d+\b", re.I)
 
 
@@ -2460,7 +2460,7 @@ def _rip_load_facts(text: str) -> dict[str, Any]:
                 if v is not None:
                     totals.append(v)
         if rip_mark is None:
-            rm = re.search(r"рип[- ]?\d{1,2}\s*исп\.?\s*[\w\d\-]{0,8}", seg, re.I)
+            rm = re.search(r"(?:рип[- ]?\d{1,2}\s*исп\.?\s*[\w\d\-]{0,8}|шпс[- ]?24(?:\s*исп\.?\s*[\w\d\-]{0,6})?)", seg, re.I)
             if rm:
                 rip_mark = re.sub(r"\s+", " ", rm.group(0)).strip(" .,-")
     if totals:
