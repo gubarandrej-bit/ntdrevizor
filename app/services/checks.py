@@ -1727,6 +1727,139 @@ def check_plan_device_counts(spec_items: list[dict], plan_files: list[dict]) -> 
     return {"status": "done", "reason": "", "findings": findings}
 
 
+# ---------- легенда условных обозначений ↔ спецификация ----------
+
+_LEGEND_KIND_WORDS = (
+    ("дымов", "smoke"),
+    ("ручн", "manual"),
+    ("теплов", "heat"),
+    ("звуков", "sound_ann"),
+    ("светов", "light_ann"),
+)
+
+# Марки извещателей/оповещателей в легенде (ограничено — только устройства
+# с типом «дымовой/ручной/тепловой/световой/звуковой»).
+_LEGEND_MARK_RE = re.compile(
+    r"(?:ДИП-\d+[\w-]*|ИДТ-?\d+[\w-]*|ИПР\s*\d+[\w-]*|ИП\s*\d{2,3}[\w-]*|ИПТ-?\w+|Маяк[\w-]*|Кристалл[\w-]*)",
+    re.I,
+)
+
+_KIND_LABEL = {
+    "smoke": "дымовой извещатель",
+    "manual": "ручной извещатель",
+    "heat": "тепловой извещатель",
+    "sound_ann": "звуковой оповещатель",
+    "light_ann": "световой оповещатель",
+}
+
+
+def _legend_kind(line: str) -> str | None:
+    low = line.lower()
+    for word, kind in _LEGEND_KIND_WORDS:
+        if word in low:
+            return kind
+    return None
+
+
+def _mark_canon(mark: str) -> str:
+    return re.sub(r"[^0-9a-zа-я]", "", mark.lower())
+
+
+def _spec_kind_for_mark(spec_items: list[dict], canon: str) -> str | None:
+    """Тип устройства по спецификации для марки (дымовой/ручной/тепловой/
+    световой/звуковой оповещатель). Большинство голосов по позициям."""
+    votes: dict[str, int] = defaultdict(int)
+    for i in spec_items:
+        if _is_cable_item(i):
+            continue
+        blob = norm(" ".join(str(i.get(k) or "") for k in ("name", "mark", "type")))
+        if not blob:
+            continue
+        if canon not in _mark_canon(blob):
+            continue
+        if any(t in blob for t in ("оповещател", "маяк", "кристалл", "табло", "выход")):
+            if "звуков" in blob or "маяк" in blob:
+                votes["sound_ann"] += int(i.get("qty") or 1)
+            else:
+                votes["light_ann"] += int(i.get("qty") or 1)
+            continue
+        kind = _detector_kind(i)
+        if kind in ("smoke", "heat", "manual"):
+            votes[kind] += int(i.get("qty") or 1)
+    if not votes:
+        return None
+    return max(votes, key=votes.get)
+
+
+def check_legend_vs_spec(spec_items: list[dict], full_text: str) -> dict[str, Any]:
+    """Легенда «Условные обозначения» ↔ спецификация: противоречия типов устройств.
+
+    В легенде тип (дымовой/ручной/тепловой/световой/звуковой) пишется рядом
+    с маркой. Сверяем с типом той же марки в спецификации. Расхождение — дефект
+    документации (обозначения на чертежах не соответствуют спецификации).
+    Марки, которых нет в спецификации, пропускаются (противоречие не определяется).
+    """
+    if not full_text:
+        return _skip("Текст документации не извлечён.")
+    legend_rows: list[tuple[str, str]] = []
+    for seg in re.split(r"(?=--- страница \d+ ---\n)", full_text):
+        if "условные обозначен" not in seg.lower():
+            continue
+        for line in seg.splitlines():
+            line = line.strip()
+            kind = _legend_kind(line)
+            if kind is None:
+                continue
+            for m in _LEGEND_MARK_RE.finditer(line):
+                mark = m.group(0).strip()
+                if mark:
+                    legend_rows.append((kind, mark))
+    if not legend_rows:
+        return _skip(
+            "Легенда «Условные обозначения» не распознана (нет строк вида «тип + марка»)."
+        )
+
+    findings: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    checked = 0
+    for kind, mark in legend_rows:
+        canon = _mark_canon(mark)
+        if len(canon) < 4:
+            continue
+        spec_kind = _spec_kind_for_mark(spec_items, canon)
+        if spec_kind is None:
+            continue
+        checked += 1
+        if spec_kind == kind:
+            continue
+        key = (kind, canon)
+        if key in seen:
+            continue
+        seen.add(key)
+        findings.append(
+            finding(
+                "noncritical",
+                "Противоречие легенды и спецификации",
+                f"В легенде «{mark}» указан как «{_KIND_LABEL.get(kind, kind)}», "
+                f"но в спецификации эта марка — «{_KIND_LABEL.get(spec_kind, spec_kind)}». "
+                "Устранить расхождение: обозначения на чертежах должны соответствовать спецификации.",
+                ["ГОСТ 21.110-2013", "ГОСТ 2.701-2008"],
+                evidence=f"легенда={kind}, спецификация={spec_kind}",
+            )
+        )
+    if not findings and checked:
+        findings.append(
+            finding(
+                "info",
+                "Легенда соответствует спецификации",
+                f"Типы устройств в легенде ({checked} марок: дымовые/ручные/тепловые извещатели, "
+                "оповещатели) совпадают с типами тех же марок в спецификации.",
+                ["ГОСТ 21.110-2013"],
+            )
+        )
+    return {"status": "done", "reason": "", "findings": findings}
+
+
 # ---------- зоны контроля и отказоустойчивость (СП 484 Изм. № 1) ----------
 
 def check_spz_zones(full_text: str, systems: list[str]) -> dict[str, Any]:

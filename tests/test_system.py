@@ -210,7 +210,27 @@ def test_new_checks_synthetic():
     )
     titles = {f["title"] for f in r["findings"]}
     assert_true(any("превышает номинал" in t for t in titles), titles)
-    print("OK new checks (compat/explication/topology/plan-count/rip-load)")
+
+    # легенда ↔ спецификация: перепутанные типы оповещателей
+    from app.services.checks import check_legend_vs_spec
+    legend_text = (
+        "--- страница 6 ---\nУсловные обозначения\n"
+        "Оповещатель звуковой Кристалл-24\n"
+        "Оповещатель световой \"ВЫХОД\" Маяк-24-ЗМ1\n"
+        "Извещатель пожарный дымовой ДИП-34А-04\n"
+    )
+    spec = [
+        {"pos": "1", "name": "Оповещатель световой \"ВЫХОД\"", "mark": "КРИСТАЛЛ-24", "type": "", "qty": 2, "length": None, "note": "", "manufacturer": ""},
+        {"pos": "2", "name": "Оповещатель звуковой", "mark": "Маяк-24-ЗМ1", "type": "", "qty": 3, "length": None, "note": "", "manufacturer": ""},
+        {"pos": "3", "name": "Извещатель пожарный дымовой", "mark": "ДИП-34А-04", "type": "", "qty": 5, "length": None, "note": "", "manufacturer": ""},
+    ]
+    r = check_legend_vs_spec(spec, legend_text)
+    titles = {f["title"] for f in r["findings"]}
+    assert_true(r["status"] == "done", r)
+    assert_true(any("Противоречие" in t for t in titles), titles)
+    # дымовой не должен дать противоречия
+    assert_true(len(r["findings"]) == 2, r["findings"])
+    print("OK new checks (compat/explication/topology/plan-count/rip-load/legend)")
 
 
 if __name__ == "__main__":

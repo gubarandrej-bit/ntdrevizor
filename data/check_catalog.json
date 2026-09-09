@@ -313,6 +313,15 @@
         "plan"
       ],
       "ai": false
+    },
+    {
+      "code": "LEGEND_VS_SPEC",
+      "title": "Легенда условных обозначений ↔ спецификация (противоречия типов)",
+      "group": "сверки",
+      "requires": [
+        "specification"
+      ],
+      "ai": false
     }
   ]
 }

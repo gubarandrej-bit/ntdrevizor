@@ -24,6 +24,7 @@ from app.services.checks import (
     check_equipment_compat,
     check_laying,
     check_laying_params,
+    check_legend_vs_spec,
     check_outdated_ntd_refs,
     check_plan_device_counts,
     check_plan_lengths,
@@ -288,6 +289,11 @@ def _run(db: Session, audit: Audit, talk: Callable) -> None:
     r = check_plan_device_counts(spec_items, plan_files)
     _store(db, audit, "PLAN_VS_SPEC_DEVICES", r["status"], r.get("reason", ""), r.get("findings", []))
     _announce(talk, "PLAN_VS_SPEC_DEVICES", r)
+
+    talk("Легенда условных обозначений ↔ спецификация…")
+    r = check_legend_vs_spec(spec_items, full_text)
+    _store(db, audit, "LEGEND_VS_SPEC", r["status"], r.get("reason", ""), r.get("findings", []))
+    _announce(talk, "LEGEND_VS_SPEC", r)
 
     talk("Проверка марок кабелей…")
     r = check_cable_mark(all_cables, systems, full_text)
