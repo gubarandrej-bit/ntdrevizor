@@ -411,7 +411,7 @@ def _run(db: Session, audit: Audit, talk: Callable) -> None:
         facts = scheme_facts(subset)
         payload = ("Извлечённые факты (обозначения/линии/ссылки):\n" + (facts or "—") + "\n\n"
                    + "Текст по листам:\n" + "\n\n".join(texts))
-        prompt = _ai_prompt(audit, systems, title, kind, payload, ntd_ctx)
+        prompt = _ai_prompt(audit, systems, title, kind, payload, ntd_ctx, checklist_kind=kind)
         result = ai_svc.complete(model_id, prompt)
         if not result.get("ok"):
             _store(db, audit, code, "skipped", f"Модель не ответила: {result.get('error')}", [])
@@ -469,14 +469,58 @@ def _run(db: Session, audit: Audit, talk: Callable) -> None:
         talk(f"  модель {model_id}, замечаний/сообщений: {len(findings)}")
 
 
-def _ai_prompt(audit: Audit, systems: list[str], title: str, kind: str, payload: str, ntd_ctx: str) -> str:
+_AI_CHECKLISTS: dict | None = None
+
+
+def _ai_checklists() -> dict:
+    """Чек-листы для ИИ-проверок (data/ai_checklists.json) с кэшем."""
+    global _AI_CHECKLISTS
+    if _AI_CHECKLISTS is None:
+        path = ROOT_DIR / "data" / "ai_checklists.json"
+        if not path.exists():
+            path = settings.data_dir / "ai_checklists.json"
+        try:
+            _AI_CHECKLISTS = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            _AI_CHECKLISTS = {}
+    return _AI_CHECKLISTS or {}
+
+
+def _checklist_block(kind: str) -> str:
+    """Текст чек-листа для промпта (нумерованный список с ссылками на НТД)."""
+    items = _ai_checklists().get(kind) or []
+    if not items:
+        return ""
+    lines = []
+    for i, it in enumerate(items, 1):
+        refs = ", ".join(it.get("refs") or [])
+        lines.append(f"{i}. {it.get('check')} ({refs})")
+    return (
+        "\nЧек-лист (пройди по КАЖДОМУ пункту; по каждому дай результат: "
+        "замечание со ссылкой на пункт НТД, либо «соответствует», либо skipped с причиной "
+        "отсутствия данных):\n" + "\n".join(lines) + "\n"
+    )
+
+
+def _ai_prompt(
+    audit: Audit,
+    systems: list[str],
+    title: str,
+    kind: str,
+    payload: str,
+    ntd_ctx: str,
+    checklist_kind: str | None = None,
+) -> str:
+    checklist = _checklist_block(checklist_kind or kind)
     return (
         f"Объект: {audit.object_name or 'не указан'}\n"
         f"Проект: {audit.title}\n"
         f"Системы: {', '.join(systems)}\n"
         f"Задача: {title} (тип {kind}).\n\n"
         "Работай ТОЛЬКО по приведённому фрагменту. Не дополняй типовыми решениями.\n"
-        "Если данных мало — findings пустой, questions заполнен, skipped с причиной.\n\n"
+        "Если данных мало — findings пустой, questions заполнен, skipped с причиной.\n"
+        "Каждое замечание — с конкретным пунктом НТД (не выдумывай номера) и evidence-цитатой.\n\n"
+        f"{checklist}"
         "Известные пункты НТД (неполный конспект, не выдумывай другие номера пунктов):\n"
         f"{ntd_ctx}\n\n"
         "Фрагмент документации:\n"
