@@ -233,8 +233,58 @@ def test_new_checks_synthetic():
     print("OK new checks (compat/explication/topology/plan-count/rip-load/legend)")
 
 
+def test_ocr_raster_page():
+    """Постраничный OCR растровых сканов (толерантно к отсутствию tesseract)."""
+    import shutil
+    import tempfile
+    from pathlib import Path as _Path
+
+    import pymupdf
+
+    from app.services.parsers import parse_pdf
+
+    # растровая страница без текстового слоя
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        print("SKIP OCR: Pillow недоступен")
+        return
+    img = Image.new("L", (1400, 900), 255)
+    d = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 30)
+    except Exception:
+        font = ImageFont.load_default()
+    d.text((60, 60), "Кабельный журнал", fill=0, font=font)
+    d.text((60, 130), "Марка: КПСЭнг(А)-FRLS 1x2x0,75", fill=0, font=font)
+    d.text((60, 190), "Длина: 123 м", fill=0, font=font)
+    buf = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    img.save(buf.name, format="PNG")
+    buf.close()
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_image(page.rect, filename=buf.name)
+    pdf = _Path(tempfile.mkdtemp()) / "scan.pdf"
+    doc.save(str(pdf))
+    doc.close()
+
+    res = parse_pdf(pdf)
+    notes = res.get("notes", "")
+    text = res.get("text", "")
+    if shutil.which("tesseract"):
+        assert_true("OCR" in notes, notes)
+        assert_true(len(text) >= 20, f"OCR не дал текста: {text[:80]!r}")
+    else:
+        # без tesseract — не падаем, помечаем причину
+        assert_true(res["ok"] is True or res["ok"] is False, res)
+        assert_true("tesseract" in notes.lower() or "ocr" in notes.lower(), notes)
+    print("OK ocr raster page" if shutil.which("tesseract") else "OK ocr skip (tesseract absent)")
+
+
 if __name__ == "__main__":
     test_parsers_and_checks()
     test_new_checks_synthetic()
+    test_ocr_raster_page()
     test_api()
     print("ВСЕ ПРОВЕРКИ РЕПОЗИТОРИЯ ПРОЙДЕНЫ")

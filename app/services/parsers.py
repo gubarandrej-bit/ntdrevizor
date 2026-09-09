@@ -1250,6 +1250,28 @@ def parse_pdf(path: Path) -> dict[str, Any]:
     for pn in range(1, min(total_pages, 80) + 1):
         if pn not in have_text:
             slow_pages.add(pn)
+
+    # страницы без текстового слоя (растровые сканы) — постраничный OCR.
+    # В смешанных PDF часть листов векторная (разбирается обычным путём),
+    # часть — сканы; их текст восстанавливаем через tesseract.
+    empty_pages = sorted(pn for pn in range(1, min(total_pages, 80) + 1) if pn not in have_text)
+    if empty_pages:
+        ocr_parts, ocr_notes = _ocr_pages(path, empty_pages[:30])
+        notes.extend(ocr_notes)
+        for tp in ocr_parts:
+            m = re.match(r"--- страница (\d+) ---\n?", tp)
+            if m and int(m.group(1)) in slow_pages:
+                slow_pages.discard(int(m.group(1)))
+            text_parts.append(tp)
+            if m:
+                have_text.add(int(m.group(1)))
+        # порядок страниц в итоговом тексте
+        def _page_no(tp: str) -> int:
+            mm = re.match(r"--- страница (\d+) ---", tp)
+            return int(mm.group(1)) if mm else 0
+
+        text_parts.sort(key=_page_no)
+
     if slow_pages and not any("пропущен" in n for n in notes):
         notes.append(f"Текст {len(slow_pages)} стр. пропущен (сложная векторная графика).")
 
@@ -1670,6 +1692,65 @@ def _ocr_pdf(path: Path) -> tuple[str, str]:
             parts.append(f"OCR стр. {i + 1}: {exc}")
     text = "\n".join(parts).strip()
     return text, "Текст получен OCR (возможны ошибки распознавания)." if text else "OCR не дал текста."
+
+
+def _ocr_pages(path: Path, pages: list[int]) -> tuple[list[str], list[str]]:
+    """OCR конкретных страниц (растровые сканы без текстового слоя).
+
+    Растеризация — PyMuPDF (get_pixmap), распознавание — tesseract CLI.
+    Возвращает (список блоков «--- страница N ---\nтекст», notes).
+    Используется для смешанных PDF: векторные листы разбираются обычным путём,
+    а растровые страницы без текста — через OCR. Текст OCR помечается как
+    ненадёжный (возможны ошибки распознавания).
+    """
+    from app.config import settings
+
+    if not settings.ocr_enabled:
+        return [], ["OCR отключён в настройках."]
+    if not shutil.which("tesseract"):
+        return [], ["Tesseract OCR не установлен (пакет tesseract-ocr-rus)."]
+    try:
+        import pymupdf
+    except ImportError:
+        return [], ["PyMuPDF недоступен — постраничный OCR не выполнен."]
+    _quiet_mupdf()
+    parts: list[str] = []
+    tmp = Path(tempfile.mkdtemp(prefix="ocrpage_"))
+    doc = pymupdf.open(str(path))
+    try:
+        for pn in pages:
+            if pn < 1 or pn > len(doc):
+                continue
+            try:
+                pix = doc[pn - 1].get_pixmap(dpi=150)
+            except Exception:
+                continue
+            img = tmp / f"p{pn}.png"
+            try:
+                pix.save(str(img))
+            except Exception:
+                continue
+            try:
+                proc = subprocess.run(
+                    ["tesseract", str(img), "stdout", "-l", "rus+eng"],
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                )
+            except Exception:
+                continue
+            txt = (proc.stdout or "").strip()
+            if txt:
+                parts.append(f"--- страница {pn} ---\n{txt}")
+    finally:
+        doc.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+    notes = []
+    if parts:
+        notes.append(
+            f"OCR: {len(parts)} растровых страниц распознано (tesseract rus+eng) — текст может содержать ошибки."
+        )
+    return parts, notes
 
 
 def _ocr_via_pdftoppm(path: Path) -> tuple[str, str]:
