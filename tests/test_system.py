@@ -211,6 +211,22 @@ def test_new_checks_synthetic():
     titles = {f["title"] for f in r["findings"]}
     assert_true(any("превышает номинал" in t for t in titles), titles)
 
+    # арифметика таблицы токов: «Всего = Кол × Ток», «Итого = Σ строк»
+    from app.services.checks import _check_current_table_arithmetic
+    bad_table = (
+        "--- страница 5 ---\nТаблица токов Реж. Дежур., мА Реж. Пожар, мА\n"
+        "Наименование Кол Ток всего Ток всего\n"
+        "РИП-12 исп.14 1 30 30 30 30.0\n"
+        "Блок индикации C2000-БКИ 2 50 120 200 400.0\n"
+        "Итого: 130.0 430.0\n"
+    )
+    t_res = {f["title"] for f in _check_current_table_arithmetic(bad_table)}
+    assert_true(any("не сходится" in t for t in t_res), t_res)
+    assert_true(any("не равен сумме" in t for t in t_res), t_res)
+    good_table = bad_table.replace("2 50 120 200 400.0", "2 50 100 200 400.0")
+    t_res2 = {f["title"] for f in _check_current_table_arithmetic(good_table)}
+    assert_true(any("сходится" in t for t in t_res2), t_res2)
+
     # легенда ↔ спецификация: перепутанные типы оповещателей
     from app.services.checks import check_legend_vs_spec
     legend_text = (

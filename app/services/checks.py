@@ -2604,6 +2604,141 @@ def _rip_load_facts(text: str) -> dict[str, Any]:
     return out
 
 
+_NUM_TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)?")
+
+
+def _current_rows_for_segment(seg: str) -> list[dict]:
+    """Строки таблицы токов из одного сегмента (страницы) текста."""
+    toks = re.split(r"[\s|]+", seg.replace("\u00a0", " "))
+    toks = [t for t in toks if t]
+    rows: list[dict] = []
+    i = 0
+    n = len(toks)
+    while i < n:
+        if not _NUM_TOKEN_RE.fullmatch(toks[i]):
+            i += 1
+            continue
+        j = i
+        nums: list[float] = []
+        while j < n and _NUM_TOKEN_RE.fullmatch(toks[j]):
+            v = parse_float(toks[j])
+            if v is None:
+                break
+            nums.append(v)
+            j += 1
+        k = i - 1
+        name_parts: list[str] = []
+        while k >= 0 and not _NUM_TOKEN_RE.fullmatch(toks[k]) and len(name_parts) < 6:
+            name_parts.append(toks[k])
+            k -= 1
+        name = " ".join(reversed(name_parts)).strip()
+        if len(nums) >= 5 and name:
+            qty, cur_d, tot_d, cur_f, tot_f = nums[-5:]
+            if 0.5 <= qty <= 200 and all(0 <= x <= 50000 for x in (cur_d, tot_d, cur_f, tot_f)):
+                rows.append({
+                    "name": name,
+                    "qty": qty,
+                    "cur_d": cur_d,
+                    "tot_d": tot_d,
+                    "cur_f": cur_f,
+                    "tot_f": tot_f,
+                })
+        i = j
+    return rows
+
+
+def _current_table_rows(text: str) -> list[dict]:
+    """Строки таблицы токов со всех страниц-таблиц (для отладки/сводки)."""
+    if not text:
+        return []
+    rows: list[dict] = []
+    for seg in re.split(r"(?=--- страница \d+ ---\n)", text):
+        if re.search(r"реж\W{0,12}дежур", seg.lower()):
+            rows.extend(_current_rows_for_segment(seg))
+    return rows
+
+
+def _seg_totals(seg: str) -> list[tuple[float, float | None]]:
+    """Итоги «Итого: X Y» внутри одного сегмента (страницы)."""
+    low = seg.lower()
+    out: list[tuple[float, float | None]] = []
+    for m in re.finditer(r"итого", low):
+        tail = seg[m.end(): m.end() + 60]
+        nums = [x for x in (parse_float(t) for t in _NUM_TOKEN_RE.findall(tail)) if x is not None]
+        if len(nums) >= 2:
+            out.append((nums[0], nums[1]))
+        elif nums:
+            out.append((nums[0], None))
+    return out
+
+
+def _check_current_table_arithmetic(text: str) -> list[dict]:
+    """Арифметическая сверка таблиц токов: «Всего = Кол × Ток» по каждой строке
+    и «Итого = Σ Всего» по каждой таблице (странице). Ловит арифметические
+    ошибки расчёта токопотребления. Только по явным числам, коэффициенты не
+    подставляются; постранично, чтобы итоги сравнивались со своей таблицей."""
+    findings: list[dict] = []
+    n_ok = 0
+    n_tables = 0
+    for seg in re.split(r"(?=--- страница \d+ ---\n)", text):
+        if not re.search(r"реж\W{0,12}дежур", seg.lower()):
+            continue
+        rows = _current_rows_for_segment(seg)
+        if not rows:
+            continue
+        n_tables += 1
+        for r in rows:
+            errs = []
+            for label, cur, tot in (
+                ("дежурный", r["cur_d"], r["tot_d"]),
+                ("пожарный", r["cur_f"], r["tot_f"]),
+            ):
+                expect = r["qty"] * cur
+                if abs(expect - tot) > max(0.5, 0.01 * abs(expect)):
+                    errs.append(f"{label}: {r['qty']:g}×{cur:g}={expect:g}, в таблице {tot:g}")
+            if errs:
+                findings.append(
+                    finding(
+                        "noncritical",
+                        "Арифметика строки таблицы токов не сходится",
+                        f"«{r['name']}»: " + "; ".join(errs) + ". Проверить расчёт токопотребления.",
+                        ["СП 6.13130.2025 прил. Б"],
+                        evidence=f"qty={r['qty']}, деж={r['cur_d']}/{r['tot_d']}, пож={r['cur_f']}/{r['tot_f']}",
+                    )
+                )
+            else:
+                n_ok += 1
+        # итог этой таблицы vs сумма её строк
+        sum_d = sum(r["tot_d"] for r in rows)
+        sum_f = sum(r["tot_f"] for r in rows)
+        for td, tf in _seg_totals(seg):
+            mismatch = []
+            if td is not None and abs(td - sum_d) > max(1.0, 0.02 * max(abs(td), abs(sum_d), 1)):
+                mismatch.append(f"дежурный: итого {td:g}, сумма строк {sum_d:g}")
+            if tf is not None and abs(tf - sum_f) > max(1.0, 0.02 * max(abs(tf), abs(sum_f), 1)):
+                mismatch.append(f"пожарный: итого {tf:g}, сумма строк {sum_f:g}")
+            if mismatch:
+                findings.append(
+                    finding(
+                        "noncritical",
+                        "Итог таблицы токов не равен сумме строк",
+                        "; ".join(mismatch) + ". Проверить суммирование нагрузки.",
+                        ["СП 6.13130.2025 прил. Б"],
+                        evidence=f"итого=({td}, {tf}), сумма=({sum_d:.1f}, {sum_f:.1f})",
+                    )
+                )
+    if not findings and n_ok:
+        findings.append(
+            finding(
+                "info",
+                "Арифметика таблиц токов сходится",
+                f"Проверено {n_ok} строк в {n_tables} таблицах: «Всего = Кол × Ток» и «Итого = Σ строк» сходятся.",
+                ["СП 6.13130.2025 прил. Б"],
+            )
+        )
+    return findings
+
+
 def check_equipment_compat(spec_items: list[dict], text: str = "") -> dict[str, Any]:
     """Совместимость оборудования спецификации: протоколы (адресность),
     искробезопасные цепи, напряжения (АКБ↔РИП, оповещатели↔источник),
@@ -2992,6 +3127,8 @@ def check_equipment_compat(spec_items: list[dict], text: str = "") -> dict[str, 
                         evidence=f"итого={totals}, rip={rip_mark}",
                     )
                 )
+        # 9а) арифметика таблицы токов: «Всего = Кол × Ток», «Итого = Σ Всего»
+        findings.extend(_check_current_table_arithmetic(text))
 
     if not findings:
         return {
