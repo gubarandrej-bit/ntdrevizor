@@ -98,6 +98,7 @@ async function boot() {
   $("#btn-user-new").onclick = () => editUser(null);
   $("#btn-save-set").onclick = saveSettings;
   $("#btn-save-pass").onclick = savePass;
+  $("#btn-cm-add").onclick = addCloudModel;
   $("#modal").onclick = (e) => { if (e.target.id === "modal") $("#modal").hidden = true; };
 
   if (state.token) {
@@ -476,6 +477,62 @@ async function loadSettings() {
   $("#set-company").value = s.company_name || "";
   $("#set-qty").value = s.qty_tolerance_pct || "5";
   $("#set-len").value = s.length_tolerance_pct || "10";
+  loadCloudModels();
+}
+
+async function loadCloudModels() {
+  const box = $("#cloud-models");
+  if (!box) return;
+  let data;
+  try { data = await api("/api/models/cloud"); } catch { return; }
+  const arr = data.models || [];
+  const isAdmin = state.user && state.user.role === "admin";
+  box.innerHTML = arr.length ? `<table><tbody>${arr.map((m) => `
+    <tr><td>${esc(m.name)}<br /><small class="muted">${esc(m.id)} · ${esc(m.base_url)} · ${esc(m.model)}${m.has_key ? " · ключ " + esc(m.key_masked) : ""}</small></td>
+    <td style="white-space:nowrap">
+      <button class="btn" data-cm-test="${esc(m.id)}">Тест</button>
+      ${isAdmin ? `<button class="btn" data-cm-del="${esc(m.id)}">Удалить</button>` : ""}
+    </td></tr>`).join("")}</tbody></table>` : '<p class="muted">Своих моделей пока нет.</p>';
+  $$("[data-cm-test]").forEach((b) => b.onclick = () => testCloudModel(b.dataset.cmTest, b));
+  $$("[data-cm-del]").forEach((b) => b.onclick = () => delCloudModel(b.dataset.cmDel));
+}
+
+async function testCloudModel(id, btn) {
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = "Тест…";
+  try {
+    const r = await api(`/api/models/cloud/${encodeURIComponent(id)}/test`, { method: "POST" });
+    toast(r.ok ? `Ответ получен (${r.elapsed_s} с): ${r.reply || "пусто"}` : `Ошибка: ${r.error}`);
+  } catch (e) { toast(e.message); }
+  btn.disabled = false;
+  btn.textContent = old;
+}
+
+async function delCloudModel(id) {
+  if (!confirm(`Удалить модель ${id}? Выбранные в проверках ссылки на неё станут «недоступна».`)) return;
+  try {
+    await api(`/api/models/cloud/${encodeURIComponent(id)}`, { method: "DELETE" });
+    toast("Удалено");
+    loadCloudModels();
+  } catch (e) { toast(e.message); }
+}
+
+async function addCloudModel() {
+  try {
+    const r = await api("/api/models/cloud", {
+      method: "POST",
+      body: JSON.stringify({
+        name: $("#cm-name").value.trim(),
+        base_url: $("#cm-url").value.trim(),
+        model: $("#cm-model").value.trim(),
+        api_key: $("#cm-key").value.trim(),
+      }),
+    });
+    ["#cm-name", "#cm-url", "#cm-model", "#cm-key"].forEach((s) => $(s).value = "");
+    toast(`Добавлено: ${r.id}`);
+    loadCloudModels();
+  } catch (e) { toast(e.message); }
 }
 
 async function saveSettings() {

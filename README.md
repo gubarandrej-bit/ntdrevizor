@@ -54,6 +54,43 @@
 
 Рекомендация: **гибрид** — сверки всегда локально и детерминированно; ИИ — Gemini Flash или GigaChat для схем и текстовых расчётов. Без ключей система **работает**: ИИ-проверки помечаются как не проведённые с причиной.
 
+## Свои облачные модели через API
+
+Любой OpenAI-совместимый endpoint (`/chat/completions`) можно добавить, обновить,
+проверить и удалить через API без правки `.env` и без перезапуска сервиса. Модель
+сразу появляется в каталоге `GET /api/models` (раздел `cloud`, id вида
+`custom:<slug>`) и её можно выбирать при создании проверки. Хранится в
+`data/custom_models.json` (права 0600, в git не попадает); API-ключ наружу не
+отдаётся — только маска `…последние4`.
+
+```bash
+TOK=$(curl -sS -X POST $HOST/api/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"…"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+# список своих моделей
+curl -sS $HOST/api/models/cloud -H "Authorization: Bearer $TOK"
+
+# добавить (только админ); id вида custom:<slug> вернётся в ответе
+MID=$(curl -sS -X POST $HOST/api/models/cloud -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -d '{"name":"Провайдер X","base_url":"https://api.example.com/v1","model":"qwen2.5-vl-7b","api_key":"sk-…"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+# проверка соединения (короткий запрос, тайм-аут 25 с)
+curl -sS -X POST "$HOST/api/models/cloud/$MID/test" -H "Authorization: Bearer $TOK"
+
+# изменить поля (ключ можно не передавать — останется прежний; "" — стереть)
+curl -sS -X PUT "$HOST/api/models/cloud/$MID" -H "Authorization: Bearer $TOK" \
+  -H 'Content-Type: application/json' -d '{"name":"Провайдер X (2GPU)"}'
+
+# удалить (только админ)
+curl -sS -X DELETE "$HOST/api/models/cloud/$MID" -H "Authorization: Bearer $TOK"
+```
+
+Добавление/обновление/удаление — роль `admin`; просмотр и тест — любой вошедший.
+Все изменения пишутся в журнал действий. Если модель удалена, а на неё ссылается
+старая проверка, ИИ-этап честно сообщит «Модель не найдена — возможно, удалена»,
+ничего не подставляя. В веб-интерфейсе то же доступно на странице «Настройки».
+
 ## Состав репозитория
 
 ```

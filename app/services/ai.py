@@ -10,6 +10,7 @@ from typing import Any, Callable
 import httpx
 
 from app.config import ROOT_DIR, settings
+from app.services import custom_models
 from app.util import truncate
 
 PromptRules = (ROOT_DIR / "data" / "prompt_rules.md")
@@ -153,6 +154,17 @@ def available_models() -> dict[str, Any]:
         "OPENAI_COMPAT_BASE_URL / KEY / MODEL.",
     )
 
+    for cm in custom_models.load_custom_models():
+        add_cloud(
+            cm["id"],
+            "custom",
+            cm["name"],
+            bool(cm["base_url"] and cm["model"]),
+            f"{cm['model']} @ {custom_models.describe_host(cm['base_url'])}; "
+            + ("ключ задан" if cm["api_key"] else "без ключа")
+            + ". Добавлено через API (/api/models/cloud).",
+        )
+
     return {
         "local": local,
         "cloud": cloud,
@@ -231,6 +243,22 @@ def complete(
                 settings.openai_compat_base_url.rstrip("/"),
                 settings.openai_compat_api_key,
                 settings.openai_compat_model or name,
+                system_prompt,
+                user_prompt,
+                timeout,
+            )
+        elif provider == "custom":
+            entry = custom_models.find(custom_models.load_custom_models(), model_id)
+            if not entry:
+                return {
+                    "ok": False,
+                    "error": f"Модель {model_id} не найдена — возможно, удалена из /api/models/cloud.",
+                    "text": "",
+                }
+            text = _openai_chat(
+                entry["base_url"].rstrip("/"),
+                entry["api_key"],
+                entry["model"],
                 system_prompt,
                 user_prompt,
                 timeout,

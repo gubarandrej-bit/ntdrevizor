@@ -33,10 +33,11 @@ from app.security import (
     verify_password,
 )
 from app.services import ai as ai_svc
+from app.services import custom_models
 from app.services.engine import answer_dialog, log_dialog
 from app.services.ntd import list_ntd, ntd_to_dict
 from app.services.reports import build_reports
-from app.util import dumps, loads, safe_filename
+from app.util import dumps, loads, safe_filename, truncate
 
 router = APIRouter(prefix="/api")
 
@@ -316,6 +317,82 @@ def ntd_check(user: User = Depends(current_user), db: Session = Depends(get_db))
 @router.get("/models")
 def models(_: User = Depends(current_user)):
     return ai_svc.available_models()
+
+
+class CloudModelIn(BaseModel):
+    name: str
+    base_url: str
+    api_key: str = ""
+    model: str = ""
+    note: str = ""
+
+
+class CloudModelPatch(BaseModel):
+    name: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+    note: str | None = None
+
+
+@router.get("/models/cloud")
+def models_cloud_list(_: User = Depends(current_user)):
+    return {"models": [custom_models.public_view(m) for m in custom_models.load_custom_models()]}
+
+
+@router.post("/models/cloud")
+def models_cloud_add(
+    payload: CloudModelIn,
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    entry, err = custom_models.add(
+        payload.name, payload.base_url, payload.api_key, payload.model, payload.note
+    )
+    if not entry:
+        raise HTTPException(status_code=400, detail=err)
+    _log(db, user, "cloud_model_add", entry["id"])
+    return custom_models.public_view(entry)
+
+
+@router.put("/models/cloud/{model_id}")
+def models_cloud_update(
+    model_id: str,
+    payload: CloudModelPatch,
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    entry, err = custom_models.update(model_id, payload.model_dump(exclude_unset=True))
+    if not entry:
+        raise HTTPException(status_code=404 if "не найдена" in err else 400, detail=err)
+    _log(db, user, "cloud_model_update", model_id)
+    return custom_models.public_view(entry)
+
+
+@router.delete("/models/cloud/{model_id}")
+def models_cloud_delete(
+    model_id: str,
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    if not custom_models.remove(model_id):
+        raise HTTPException(status_code=404, detail="Модель не найдена")
+    _log(db, user, "cloud_model_delete", model_id)
+    return {"ok": True}
+
+
+@router.post("/models/cloud/{model_id}/test")
+def models_cloud_test(model_id: str, _: User = Depends(current_user)):
+    entry = custom_models.find(custom_models.load_custom_models(), model_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Модель не найдена")
+    res = ai_svc.complete(model_id, "Ответь ровно одно слово: ок", timeout=25.0)
+    return {
+        "ok": bool(res.get("ok")),
+        "error": res.get("error", ""),
+        "reply": truncate(res.get("text", ""), 200),
+        "elapsed_s": res.get("elapsed_s"),
+    }
 
 
 @router.get("/settings")

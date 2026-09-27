@@ -13,6 +13,7 @@ data/uploads/
 data/reports/
 data/models/
 data/tmp/
+data/custom_models.json
 *.gguf
 .pytest_cache/
 .mypy_cache/

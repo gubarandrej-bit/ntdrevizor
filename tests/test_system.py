@@ -298,9 +298,70 @@ def test_ocr_raster_page():
     print("OK ocr raster page" if shutil.which("tesseract") else "OK ocr skip (tesseract absent)")
 
 
+def test_cloud_models_api():
+    """CRUD своих облачных моделей через API + попадание в каталог /api/models."""
+    init_db()
+    from app.main import app
+
+    client = TestClient(app)
+    login = client.post("/api/auth/login", json={"username": "admin", "password": settings.admin_password})
+    assert_true(login.status_code == 200, login.text)
+    hdr = {"Authorization": f"Bearer {login.json()['token']}"}
+
+    secret = "sk-test-1234567890abcdef"
+    base = client.get("/api/models/cloud", headers=hdr)
+    assert_true(base.status_code == 200, base.text)
+    n0 = len(base.json()["models"])
+
+    # невалидный base_url → 400 с причиной
+    bad = client.post(
+        "/api/models/cloud",
+        headers=hdr,
+        json={"name": "Сломанная", "base_url": "ftp://x", "model": "m", "api_key": secret},
+    )
+    assert_true(bad.status_code == 400 and "http" in bad.json()["detail"], bad.text)
+
+    name = f"Тестовая LLM {int(time.time())}"
+    added = client.post(
+        "/api/models/cloud",
+        headers=hdr,
+        json={"name": name, "base_url": "http://127.0.0.1:9/v1", "model": "test-llm", "api_key": secret},
+    )
+    assert_true(added.status_code == 200, added.text)
+    entry = added.json()
+    mid = entry["id"]
+    assert_true(mid.startswith("custom:"), mid)
+    assert_true(entry["has_key"] is True, entry)
+    assert_true(secret not in added.text, "ключ не должен отдажаться в ответе API")
+
+    # модель появилась в облачном каталоге и она ready
+    cat = client.get("/api/models", headers=hdr).json()
+    hit = [m for m in cat["cloud"] if m["id"] == mid]
+    assert_true(hit and hit[0]["ready"] is True, hit)
+
+    # тест соединения: закрытый порт → честная ошибка без падения
+    t = client.post(f"/api/models/cloud/{mid}/test", headers=hdr)
+    assert_true(t.status_code == 200 and t.json()["ok"] is False, t.text)
+    assert_true(bool(t.json()["error"]), t.text)
+
+    # обновление имени
+    up = client.put(f"/api/models/cloud/{mid}", headers=hdr, json={"name": name + " v2"})
+    assert_true(up.status_code == 200 and up.json()["name"].endswith("v2"), up.text)
+
+    # удаление
+    dele = client.delete(f"/api/models/cloud/{mid}", headers=hdr)
+    assert_true(dele.status_code == 200 and dele.json()["ok"], dele.text)
+    assert_true(len(client.get("/api/models/cloud", headers=hdr).json()["models"]) == n0, "список не вернулся к исходному")
+    gone = client.get("/api/models", headers=hdr).json()
+    assert_true(not [m for m in gone["cloud"] if m["id"] == mid], "модель осталась в каталоге")
+    assert_true(client.delete(f"/api/models/cloud/{mid}", headers=hdr).status_code == 404, "повторное удаление не 404")
+    print("OK cloud models api")
+
+
 if __name__ == "__main__":
     test_parsers_and_checks()
     test_new_checks_synthetic()
     test_ocr_raster_page()
     test_api()
+    test_cloud_models_api()
     print("ВСЕ ПРОВЕРКИ РЕПОЗИТОРИЯ ПРОЙДЕНЫ")

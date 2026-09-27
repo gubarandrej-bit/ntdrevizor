@@ -181,7 +181,19 @@
               <button id="btn-save-set" class="btn primary">Сохранить</button>
               <button id="btn-save-pass" class="btn">Сменить пароль</button>
             </div>
-            <p class="muted">Ключи облачных моделей задаются в файле <code>.env</code> на сервере (см. INSTALL.md). В интерфейсе они не хранятся.</p>
+            <p class="muted">Ключи встроенных моделей (Gemini, Groq, GigaChat…) задаются в файле <code>.env</code> на сервере (см. INSTALL.md). Свои OpenAI-совместимые модели можно добавлять ниже — ключ хранится в <code>data/custom_models.json</code> (права 0600) и наружу не отдаётся.</p>
+          </div>
+          <div class="panel narrow">
+            <h2>Облачные модели (свои endpoints)</h2>
+            <div id="cloud-models" class="table-wrap"></div>
+            <label>Название<input id="cm-name" placeholder="Например: Промысл VLM через vLLM" /></label>
+            <label>Base URL<input id="cm-url" placeholder="https://host:port/v1 (OpenAI-совместимый)" /></label>
+            <label>Имя модели у провайдера<input id="cm-model" placeholder="например qwen2.5-vl-7b-instruct" /></label>
+            <label>API-ключ (необязательно)<input id="cm-key" type="password" placeholder="Bearer-ключ, если требуется" /></label>
+            <div class="row">
+              <button id="btn-cm-add" class="btn primary">Добавить модель</button>
+            </div>
+            <p class="muted">Добавление/удаление доступны администратору. Модель сразу появляется в списке моделей при создании проверки.</p>
           </div>
         </section>
       </main>
