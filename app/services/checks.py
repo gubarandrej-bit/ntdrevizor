@@ -237,7 +237,7 @@ def check_spec_journal_names(spec_items: list[dict], journal: list[dict]) -> dic
             finding(
                 "critical",
                 "Марка из журнала отсутствует в спецификации",
-                f"Позиция журнала «{j.get('name') or ''} {j.get('mark') or ''}» "
+                f"Позиция журнала «{_name_mark(j)}» "
                 f"({j.get('from') or '?'} → {j.get('to') or '?'}) не найдена в спецификации.",
                 ["ГОСТ 21.110-2013", "ГОСТ 21.613-2014"],
                 evidence=f"ключ сверки: {jk}",
@@ -254,7 +254,7 @@ def check_spec_journal_names(spec_items: list[dict], journal: list[dict]) -> dic
             finding(
                 "noncritical",
                 "Кабель спецификации не встретился в журнале",
-                f"Позиция спецификации «{s.get('name') or ''} {s.get('mark') or ''}» не сопоставлена ни с одной строкой журнала.",
+                f"Позиция спецификации «{_name_mark(s)}» не сопоставлена ни с одной строкой журнала.",
                 ["ГОСТ 21.110-2013"],
                 evidence=f"ключ сверки: {sk}",
                 location=s.get("_file", ""),
@@ -407,13 +407,33 @@ def _cable_key(i: dict) -> str:
     return f"{left}|{sec}"
 
 
+def _name_mark(i: dict) -> str:
+    """«Наименование (марка)» для текстов замечаний без двойного повтора,
+    когда парсер положил одну и ту же строку в name и mark."""
+    name = re.sub(r"\s+", " ", str(i.get("name") or "")).strip()
+    mark = re.sub(r"\s+", " ", str(i.get("mark") or "")).strip()
+    if not name:
+        return mark
+    if not mark or mark == name:
+        return name
+    return f"{name} ({mark})"
+
+
 def _fuzzy_in(key: str, mapping: dict) -> bool:
     if key in mapping:
         return True
     a = key.split("|")[0]
     for other in mapping:
         b = other.split("|")[0]
-        if a and b and fuzz.ratio(a, b) >= 92:
+        # длинный артикул (NMF-4XE-024A1C-BK…) может быть в журнале с
+        # дописанным числом волокон/жил («…BK 24 ОВ») — считаем совпадением,
+        # если один ключ является префиксом другого (только для ≥12 символов,
+        # чтобы не склеить «ввгнг» с «ввгнг…» из разных семейств);
+        # короткие марки — только по fuzzy-походждению
+        prefixed = (
+            a and b and min(len(a), len(b)) >= 12 and (a.startswith(b) or b.startswith(a))
+        )
+        if a and b and (fuzz.ratio(a, b) >= 92 or prefixed):
             # сечение если есть у обоих — должно совпасть
             sa = key.split("|")[1] if "|" in key else ""
             sb = other.split("|")[1] if "|" in other else ""
@@ -737,18 +757,29 @@ def check_spec_journal_section(spec_items: list[dict], journal: list[dict]) -> d
                 )
             )
     # тип/марка: сравниваем поле «тип», когда оно заполнено в обоих документах
+    def _tc(s: str) -> str:
+        # Техническая марка без префикса производителя, сечения, скобок,
+        # пробелов и дефисов: в журнале колонка «Тип» без «СПЕЦЛАН/Хайперлайн»,
+        # в спецификации — с ним; это не различие марок.
+        return compact_mark(_strip_section_from_mark(_strip_vendor(s)))
+
     for b in sorted(set(spec_type) & set(jour_type)):
         st, jt = spec_type[b], jour_type[b]
-        if st and jt and not (st & jt):
-            findings.append(
-                finding(
-                    "noncritical",
-                    "Тип кабеля в журнале отличается от спецификации",
-                    f"«{b}»: тип в спецификации {', '.join(sorted(st))}, в журнале {', '.join(sorted(jt))}.",
-                    ["ГОСТ 21.110-2013", "ГОСТ 21.613-2014"],
-                    evidence=f"spec_type={sorted(st)}, journal_type={sorted(jt)}",
-                )
+        if not (st and jt) or (st & jt):
+            continue
+        stc = {x for x in (_tc(s) for s in st) if x}
+        jtc = {x for x in (_tc(s) for s in jt) if x}
+        if stc & jtc or any(a in c or c in a for a in stc for c in jtc):
+            continue
+        findings.append(
+            finding(
+                "noncritical",
+                "Тип кабеля в журнале отличается от спецификации",
+                f"«{b}»: тип в спецификации {', '.join(sorted(st))}, в журнале {', '.join(sorted(jt))}.",
+                ["ГОСТ 21.110-2013", "ГОСТ 21.613-2014"],
+                evidence=f"spec_type={sorted(st)}, journal_type={sorted(jt)}",
             )
+        )
     return {"status": "done", "reason": "", "findings": findings}
 
 
@@ -1280,7 +1311,7 @@ def check_cable_mark(items: list[dict], systems: list[str], full_text: str) -> d
                     finding(
                         "critical",
                         "Кабель СПЗ без индекса огнестойкости FR",
-                        f"«{c.get('name') or ''} {c.get('mark') or ''}» применяется в комплекте систем противопожарной защиты, индекс FR не обнаружен. "
+                        f"«{_name_mark(c)}» применяется в комплекте систем противопожарной защиты, индекс FR не обнаружен. "
                         "Исключения СП 6.13130.2025 в проекте не подтверждены — не зачитываются.",
                         ["СП 6.13130.2025", "ГОСТ 31565-2012", "ГОСТ Р 53316", "ФЗ-123 ст. 82"],
                         location=c.get("_file", ""),
@@ -2096,7 +2127,7 @@ def check_cable_section(items: list[dict], calc_text: str) -> dict[str, Any]:
                 finding(
                     "critical",
                     "Сечение меньше допустимого по току",
-                    f"«{i.get('name') or ''} {i.get('mark') or ''}»: Iрасч={current:.2f} А > Iдоп={i_dop} А "
+                    f"«{_name_mark(i)}»: Iрасч={current:.2f} А > Iдоп={i_dop} А "
                     f"({metal}, {mm2} мм², {col}, без поправочных коэффициентов — условия среды не заданы).",
                     [table["source"], "ПУЭ-7 п. 1.3.10"],
                     location=i.get("_file", ""),

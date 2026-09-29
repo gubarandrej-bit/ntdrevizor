@@ -35,11 +35,17 @@ def norm(text: str) -> str:
     return text
 
 
+# Гомоглифы: CAD-экспорты пишут марки вперемешку латиницей и кириллицей
+# («24 OB» и «24 ОВ») — сравнение марок должно от этого не ломаться.
+_CONFUSABLES = str.maketrans({"а": "a", "в": "b", "е": "e", "о": "o", "р": "p", "с": "c", "к": "k", "м": "m"})
+
+
 def compact_mark(text: str) -> str:
     t = norm(text)
     t = t.replace(" ", "")
     t = t.replace("(", "").replace(")", "")
     t = t.replace("-", "").replace("_", "")
+    t = t.translate(_CONFUSABLES)
     return t
 
 
@@ -59,6 +65,10 @@ CABLE_MARK_RE = re.compile(
 
 SECTION_RE = re.compile(
     r"(?i)(\d+(?:[.,]\d+)?)\s*[xх×]\s*(\d+(?:[.,]\d+)?)\s*(?:мм2|мм²)?"
+)
+# Симметричные cables: «1x2x0,75» — 1 пара × 2 жилы × 0,75 мм²
+SECTION_PAIR_RE = re.compile(
+    r"(?i)(\d+)\s*[xх×*]\s*(\d+)\s*[xх×*]\s*(\d+(?:[.,]\d+)?)\s*(?:мм2|мм²)?"
 )
 SECTION_SIMPLE_RE = re.compile(r"(?i)(\d+(?:[.,]\d+)?)\s*(?:мм2|мм²)")
 NUMBER_RE = re.compile(r"-?\d+(?:[.,]\d+)?")
@@ -84,6 +94,20 @@ def parse_section(text: str) -> dict[str, Any] | None:
     if not text:
         return None
     raw = str(text)
+    # Симметричные кабели связи: «1x2x0,75» = 1 пара × 2 жилы × 0,75 мм².
+    # Без этого правила парсер брал «1x2» и выдавал mm2=2.0 — число 0,75
+    # терялось («подменяются символы»).
+    mp = SECTION_PAIR_RE.search(raw.replace(" ", ""))
+    if mp:
+        p, c, s = int(mp.group(1)), int(mp.group(2)), parse_float(mp.group(3))
+        if s is not None and 0.35 <= s <= 6.0 and 1 <= p <= 61 and 2 <= c <= 4:
+            return {
+                "cores": p * c,
+                "pairs": p,
+                "conductors": c,
+                "mm2": s,
+                "raw": mp.group(0),
+            }
     m = SECTION_RE.search(raw.replace(" ", ""))
     if m:
         cores = parse_float(m.group(1))

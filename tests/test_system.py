@@ -298,6 +298,67 @@ def test_ocr_raster_page():
     print("OK ocr raster page" if shutil.which("tesseract") else "OK ocr skip (tesseract absent)")
 
 
+def test_parser_wrapping():
+    """CAD-переносы в таблицах: склейка марок, сечение парных кабелей, колонки журнала."""
+    from app.util import parse_section
+    from app.services.parsers import _cell, _merge_wrapped_rows, _journal_columns, _record_to_item
+
+    # перенос через дефис склеивается без пробела
+    assert_true(_cell("КСБГСнг(А)-\nFRLS") == "КСБГСнг(А)-FRLS", _cell("КСБГСнг(А)-\nFRLS"))
+    assert_true(_cell("Кабель витая\nпара") == "Кабель витая пара", _cell("Кабель витая\nпара"))
+
+    # тройное сечение симметричного кабеля
+    s = parse_section("КПСЭнг(А)-FRLS 1x2x0,75")
+    assert_true(s and s["mm2"] == 0.75 and s["cores"] == 2 and s.get("pairs") == 1, s)
+    s = parse_section("СПЕЦЛАН SF/UTP Cat5e ZH нг(А)-HF 4x2x0,52")
+    assert_true(s and s["mm2"] == 0.52 and s["pairs"] == 4 and s["cores"] == 8, s)
+    s = parse_section("ВВГнг(А)-LS 3х2,5")
+    assert_true(s and s["cores"] == 3 and s["mm2"] == 2.5, s)
+
+    # склейка строк-продолжений многострочных ячеек
+    body = [
+        ["3.6", "Кабель витая пара, категория 5e, 4 пары,", "СПЕЦЛАН SF/UTP Cat5e ZH", "м", "6", ""],
+        ["", "групповой прокладки, из полимерной", "нг(А)-HF 4x2x0,52", "", "", ""],
+        ["", "композиции", "ТУ 16.К99-058-2014", "", "", ""],
+        ["3.7", "Провод ПуГВ", "ПуГВ 1х6", "м", "5", ""],
+    ]
+    mapped = {"pos": 0, "name": 1, "mark": 2, "unit": 3, "qty": 4, "note": 5}
+    merged = _merge_wrapped_rows(body, mapped)
+    assert_true(len(merged) == 2, merged)
+    assert_true("нг(А)-HF 4x2x0,52" in merged[0][2], merged[0])
+    assert_true("композиции" in merged[0][1], merged[0])
+    assert_true(merged[0][5].startswith("ТУ"), f"ТУ должен уйти в примечание: {merged[0]}")
+    assert_true(merged[1][0] == "3.7", merged[1])
+
+    # вложение ОКЛ («- кабель …») не склеивается с родителем
+    body2 = [
+        ["3.1", "Огнестойкая кабельная линия в составе:", "ОКЛ", "компл.", "1", ""],
+        ["", "- кабель КПСЭнг(А)-FRLS 1x2x0,75 - 27 м;", "", "", "", ""],
+    ]
+    merged2 = _merge_wrapped_rows(body2, mapped)
+    assert_true(len(merged2) == 2, merged2)
+
+    # мусор штампа не становится позицией
+    junk = _record_to_item({"pos": "", "name": "Согласовано 08.21", "mark": "", "unit": "", "qty": None}, "p1_t1")
+    assert_true(junk is None, junk)
+    junk2 = _record_to_item({"pos": "", "name": "Бирюлин", "mark": "", "unit": "", "qty": None}, "p1_t1")
+    assert_true(junk2 is None, junk2)
+
+    # двухстрочная шапка журнала ПС: все колонки найдены
+    rows = [
+        ["", "Монтажная\nединица", "Обозначение\nкабеля по\nпроекту", "Заводская марка", "", "Число\nрез. жил",
+         "Направление кабеля", "", "", "", "Длина, м", "", "Примечание", ""],
+        ["", "", "", "Тип", "Кол.,\nчисло и\nсечение жил", "", "Начало", "Конец", "", "", "по\nпроекту", "проло-жено", "", ""],
+        ["", "", "PS1.RS1-1", "КСБГСнг(А)-FRLS", "2x2x0,78", "2", "Шкаф ШПС1", "PS1.BZL", "", "", "2", "", "П-1; КК-1", ""],
+    ]
+    cols = _journal_columns(rows)
+    assert_true(cols["mark"] == 3 and cols["sec"] == 4 and cols["len"] == 10, cols)
+    assert_true(cols["desig"] == 2 and cols["from"] == 6 and cols["to"] == 7, cols)
+    assert_true(cols["reserve"] == 5 and cols["laid"] == 11 and cols["note"] == 12, cols)
+    assert_true(cols["me"] == 1, cols)
+    assert_true(0 in cols["header_rows"] and 1 in cols["header_rows"], cols["header_rows"])
+
+
 def test_cloud_models_api():
     """CRUD своих облачных моделей через API + попадание в каталог /api/models."""
     init_db()

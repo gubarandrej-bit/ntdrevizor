@@ -853,6 +853,8 @@ def _journal_line_to_item(line: str) -> dict[str, Any] | None:
         parsed = parse_section(sec_raw)
         if parsed:
             section = parsed
+        if _secnorm(sec_raw) not in _secnorm(mark):
+            mark = f"{mark} {sec_raw}".strip()
     return {
         "name": mark,
         "mark": mark,
@@ -891,7 +893,28 @@ def _words_to_lines(words: list, y_tol: float = 4.0) -> list[str]:
     out: list[str] = []
     for ln in lines:
         ln.sort(key=lambda w: w[0])
-        out.append(" ".join(str(w[4]) for w in ln))
+        toks = [(float(w[0]), float(w[2]), str(w[4])) for w in ln]
+        # Посимвольный CAD/XPS-экспорт: почти каждый токен — один глиф.
+        # Строку собираем по межсловным интервалам: зазор больше половины
+        # медианной ширины глифа — это пробел, меньше — склейка в слово.
+        # Иначе «КПСЭнг(А)-FRLS» приходит как «К П С Э н г ( А ) - F R L S».
+        singles = sum(1 for _, _, t in toks if len(t) == 1)
+        if len(toks) >= 6 and singles >= 0.6 * len(toks):
+            widths = sorted(x1 - x0 for x0, x1, _ in toks)
+            med = widths[len(widths) // 2] if widths else 1.0
+            s = ""
+            prev_x1: float | None = None
+            for x0, x1, t in toks:
+                if prev_x1 is None:
+                    s = t
+                elif x0 - prev_x1 > 0.55 * med:
+                    s += " " + t
+                else:
+                    s += t
+                prev_x1 = x1
+            out.append(s)
+        else:
+            out.append(" ".join(t for _, _, t in toks))
     return out
 
 
@@ -980,9 +1003,24 @@ _JOURNAL_HEADER_CELLS = (
 )
 
 
-def _journal_columns(rows: list[list[str]]) -> tuple[int | None, int | None, int | None, set[int]]:
-    """Индексы колонок «марка / сечение / длина» и номера строк-заголовков."""
-    mark_c = sec_c = len_c = None
+def _secnorm(s: str) -> str:
+    """Норма сечения для сравнения: «1x2x0,75» == «1х2х0.75»."""
+    return re.sub(r"[\s,.]", "", str(s or "").lower()).replace("х", "x").replace("×", "x")
+
+
+def _journal_columns(rows: list[list[str]]) -> dict[str, Any]:
+    """Индексы колонок кабельного журнала и номера строк-заголовков.
+
+    Покрывает оба формата: СС3 «Маркировка | Марка | Длина» и ПС
+    «Монтажная единица | Обозначение кабеля | Заводская марка (Тип | Кол.,
+    число и сечение жил) | Число рез. жил | Начало | Конец | Длина, м
+    (по проекту | проложено) | Примечание» с двухстрочной шапкой.
+    """
+    cols: dict[str, Any] = {
+        "mark": None, "sec": None, "len": None, "laid": None,
+        "from": None, "to": None, "note": None, "desig": None,
+        "me": None, "reserve": None,
+    }
     header_rows: set[int] = set()
     for ri, row in enumerate(rows[:6]):
         for i, c in enumerate(row):
@@ -991,13 +1029,37 @@ def _journal_columns(rows: list[list[str]]) -> tuple[int | None, int | None, int
                 continue
             if any(h in cl for h in ("марка", "направление кабеля", "длина", "сечение", "начало", "конец", "монтажная", "обозначение")):
                 header_rows.add(ri)
-            if mark_c is None and "марка" in cl and "обознач" not in cl and "маркировка" not in cl:
-                mark_c = i
-            if sec_c is None and ("сечение" in cl or "число и сечение" in cl):
-                sec_c = i
-            if len_c is None and "длина" in cl:
-                len_c = i
-    return mark_c, sec_c, len_c, header_rows
+            if cols["desig"] is None and ("маркиров" in cl or ("обозначен" in cl and "кабел" in cl)):
+                cols["desig"] = i
+                continue
+            if cols["mark"] is None and ("марка" in cl or cl.startswith("тип")) and "обозначен" not in cl and "маркиров" not in cl:
+                cols["mark"] = i
+                continue
+            if cols["sec"] is None and ("сечен" in cl or ("число" in cl and "жил" in cl and "рез" not in cl)):
+                cols["sec"] = i
+                continue
+            if cols["reserve"] is None and "рез" in cl:
+                cols["reserve"] = i
+                continue
+            if cols["from"] is None and ("начало" in cl or "откуда" in cl):
+                cols["from"] = i
+                continue
+            if cols["to"] is None and ("конец" in cl or "куда" in cl):
+                cols["to"] = i
+                continue
+            if cols["len"] is None and "длин" in cl:
+                cols["len"] = i
+                continue
+            if cols["laid"] is None and "проло" in cl:
+                cols["laid"] = i
+                continue
+            if cols["note"] is None and ("примечан" in cl or "способ проклад" in cl or "проклад" in cl):
+                cols["note"] = i
+                continue
+            if cols["me"] is None and "монтажн" in cl:
+                cols["me"] = i
+    cols["header_rows"] = header_rows
+    return cols
 
 
 def _parse_journal_tables_pymupdf(path: Path, page_texts: dict[int, str]) -> tuple[list[dict[str, Any]], list[str]]:
@@ -1028,45 +1090,60 @@ def _parse_journal_tables_pymupdf(path: Path, page_texts: dict[int, str]) -> tup
             page_hits = 0
             page_totals = 0
             for t in tabs.tables:
-                rows = [[("" if c is None else str(c)) for c in row] for row in t.extract()]
+                rows = [[_cell(c) for c in row] for row in t.extract()]
                 if not rows:
                     continue
-                mark_c, sec_c, len_c, header_rows = _journal_columns(rows)
-                if mark_c is None and len_c is None:
+                cols = _journal_columns(rows)
+                header_rows = cols.pop("header_rows")
+                if cols["mark"] is None and cols["len"] is None and cols["desig"] is None:
                     continue
                 in_total = False
                 for ri, row in enumerate(rows):
                     if ri in header_rows:
                         continue
+
+                    def _g(row: list[str], key: str) -> str:
+                        i = cols.get(key)
+                        return str(row[i]).strip() if i is not None and i < len(row) else ""
+
                     joined = " ".join(str(c) for c in row).lower()
                     if "итого" in joined:
                         in_total = True
                     is_total = in_total
-                    if mark_c is None or mark_c >= len(row):
-                        continue
-                    mark = str(row[mark_c]).strip()
+                    tip = _g(row, "mark")
+                    sec_t = _g(row, "sec")
+                    mark = tip
+                    if sec_t and _secnorm(sec_t) not in _secnorm(mark):
+                        mark = f"{mark} {sec_t}".strip()
                     if not mark:
                         continue
                     if mark.lower().strip() in _JOURNAL_HEADER_CELLS:
                         continue
-                    length = parse_float(row[len_c]) if (len_c is not None and len_c < len(row)) else None
+                    if _STAMP_ROW_RE.match(mark) or _STAMP_JUNK_RE.search(mark):
+                        continue
+                    length = parse_float(_g(row, "len"))
                     if length is None and is_total:
                         # запасной вариант: последнее число строки
                         nums = [parse_float(str(c)) for c in row if str(c).strip()]
                         nums = [n for n in nums if n is not None]
                         length = nums[-1] if nums else None
-                    section_raw = str(row[sec_c]).strip() if (sec_c is not None and sec_c < len(row)) else ""
-                    parsed = parse_section(section_raw) if section_raw else None
+                    parsed = parse_section(sec_t or mark)
                     journal.append(
                         {
+                            "pos": _g(row, "desig"),
                             "name": mark,
                             "mark": mark,
-                            "type": "",
+                            "type": tip,
                             "section": parsed,
                             "length": length,
                             "qty": None,
-                            "from": "",
-                            "to": "",
+                            "unit": "м",
+                            "from": _g(row, "from"),
+                            "to": _g(row, "to"),
+                            "laying": _g(row, "note"),
+                            "reserve": _g(row, "reserve"),
+                            "mount_unit": _g(row, "me"),
+                            "laid": parse_float(_g(row, "laid")),
                             "sheet": f"p{pn}_journal",
                             "is_total": is_total,
                         }
@@ -1295,6 +1372,10 @@ def parse_pdf(path: Path) -> dict[str, Any]:
 
         def _priority(pn: int) -> int:
             low = page_texts.get(pn, "").lower()
+            # Ведомость изменений — не спецификация; её строки («Изм. Лист
+            # № докум. Подп. Дата») не должны попадать в items.
+            if "ведомость измен" in low or "лист регистрации измен" in low:
+                return 4
             # схемные «Перечень элементов» — это не спецификация, а список
             # оборудования схем; он дублирует позиции спецификации и содержит
             # десятки мелких таблиц, на которых find_tables медленный. Пропускаем.
@@ -1336,6 +1417,7 @@ def parse_pdf(path: Path) -> dict[str, Any]:
                         headers = rows[hi]
                         body = rows[hi + 1 :]
                     mapped = _map_headers(headers)
+                    body = _merge_wrapped_rows(body, mapped)
                     records = []
                     for row in body:
                         rec = {k: row[idx] if idx < len(row) else "" for k, idx in mapped.items()}
@@ -1380,8 +1462,9 @@ def parse_pdf(path: Path) -> dict[str, Any]:
                                 continue
                             headers = rows[0]
                             mapped = _map_headers(headers)
+                            body = _merge_wrapped_rows(rows[1:], mapped)
                             records = []
-                            for row in rows[1:]:
+                            for row in body:
                                 rec = {k: row[idx] if idx < len(row) else "" for k, idx in mapped.items()}
                                 rec["_raw"] = row
                                 records.append(rec)
@@ -1928,6 +2011,59 @@ def _pymupdf_page_tables_subprocess(path: Path, pages: list[int]) -> tuple[dict[
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _merge_wrapped_rows(body: list[list[str]], mapped: dict[str, int]) -> list[list[str]]:
+    """Склеивает строки-продолжения многострочных ячеек с родительской строкой.
+
+    В CAD-экспортах ячейка «Наименование/Марка» переносится на 2–3 визуальные
+    строки, и find_tables отдаёт их отдельными рядами без Поз. и Кол-во.
+    Без склейки марка обрезается («СПЕЦЛАН SF/UTP Cat5e ZH» вместо «…нг(А)-HF
+    4x2x0,52») — пользователь видит это как «пропущенные символы».
+    Вложенные позиции ОКЛ («- кабель …», «- кабеленесущий …») не склеиваем:
+    это самостоятельные строки для ВОР. Отдельная строка «ТУ …» уходит в
+    Примечание, чтобы не портить сверку марок.
+    """
+    pos_i = mapped.get("pos")
+    qty_i = mapped.get("qty")
+    unit_i = mapped.get("unit")
+    note_i = mapped.get("note")
+    out: list[list[str]] = []
+    for row in body:
+        row = [str(c) if c is not None else "" for c in row]
+
+        def _get(i: int | None) -> str:
+            return str(row[i]).strip() if i is not None and i < len(row) else ""
+
+        texts = [(i, str(c).strip()) for i, c in enumerate(row) if str(c).strip()]
+        # чистый мусор штампа — выбрасываем целиком
+        if texts and all(_STAMP_ROW_RE.match(t) or _STAMP_JUNK_RE.search(t) for _, t in texts):
+            continue
+        is_cont = (
+            bool(out)
+            and bool(texts)
+            and not _get(pos_i)
+            and not _get(qty_i)
+            and not _get(unit_i)
+        )
+        if is_cont:
+            parent = out[-1]
+            p_pos = str(parent[pos_i]).strip() if pos_i is not None and pos_i < len(parent) else ""
+            first = texts[0][1]
+            # склеиваем только к строке с номером позиции и не к списку ОКЛ
+            if p_pos and not re.match(r"^[-–—]\s", first):
+                for i, txt in texts:
+                    if _STAMP_ROW_RE.match(txt) or _STAMP_JUNK_RE.search(txt):
+                        continue
+                    tgt = note_i if (_CONT_DOC_RE.match(txt) and note_i is not None) else i
+                    while len(parent) <= tgt:
+                        parent.append("")
+                    cur = str(parent[tgt]).strip()
+                    if txt not in cur:
+                        parent[tgt] = (cur + " " + txt).strip()
+                continue
+        out.append(row)
+    return out
+
+
 def _header_row(rows: list[list[Any]]) -> int | None:
     best_i, best_s = None, 0
     for i, row in enumerate(rows[:12]):
@@ -1995,15 +2131,52 @@ def _record_to_item(rec: dict[str, Any], sheet: str) -> dict[str, Any] | None:
     }
     if item["length"] is None and item["unit"] in {"м", "м.", "м.п", "м.п.", "п.м", "пм"} and item["qty"]:
         item["length"] = item["qty"]
+    # Фильтр штампов — только для таблиц, собранных из PDF-листов чертежей
+    # (sheet вида «p53_t1»): у них штамп рамки попадает в find_tables.
+    # Электронные таблицы (ВОР, спецификации xlsx) не трогаем: там «Проверка…»,
+    # «Лист…» — настоящие строки.
+    if re.match(r"^p\d+_t\d+$", sheet or ""):
+        if (
+            not item["pos"]
+            and item["qty"] is None
+            and not item["unit"]
+            and not item["mark"]
+            and item["length"] is None
+        ):
+            return None
+        stamp_blob = f"{name} {item['mark']}"
+        if _STAMP_ROW_RE.match(name) or _STAMP_JUNK_RE.search(stamp_blob):
+            return None
     return item
 
 
 def _cell(value: Any) -> str:
+    """Текст ячейки таблицы: склеивает переносы строк CAD-экспорта.
+
+    «КСБГСнг(А)-⏎FRLS» → «КСБГСнг(А)-FRLS» (после дефиса — без пробела),
+    прочие переводы строк — в один пробел. Это лечит «пропущенные буквы»:
+    марка теряла хвост, когда ячейка была разбита на несколько визуальных строк.
+    """
     if value is None:
         return ""
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
-    return str(value).strip()
+    s = str(value)
+    s = re.sub(r"\s*-\s*\n\s*", "-", s)
+    s = re.sub(r"\s*\n\s*", " ", s)
+    return re.sub(r"[ \t\u00a0]+", " ", s).strip()
+
+
+# Строки/ячейки штампа чертежа — не данные спецификации
+_STAMP_ROW_RE = re.compile(
+    r"(?i)^(инв\.\s*№|подп\.|взам\.|лист$|листов$|утв|согласов|н\.\s*контр|"
+    r"провер|составил|формат\s*а\d|стадия|подпис|архив|л.\s*\d)"
+)
+_STAMP_JUNK_RE = re.compile(
+    r"(?i)(внесена информация об измен|\(зам\.\)\s*|\(нов\.\)\s*|грк-[\d-]{4,})"
+)
+# Продолжение ячейки: отдельная строка с обозначением документа (ТУ/СТО/…)
+_CONT_DOC_RE = re.compile(r"^(?:ТУ|СТО|ТР|RP|РД?)\b[\s№/\d.]", re.IGNORECASE)
 
 
 def _base(**kwargs) -> dict[str, Any]:
