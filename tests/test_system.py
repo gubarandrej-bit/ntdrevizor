@@ -358,6 +358,31 @@ def test_parser_wrapping():
     assert_true(cols["me"] == 1, cols)
     assert_true(0 in cols["header_rows"] and 1 in cols["header_rows"], cols["header_rows"])
 
+    # склейка посимвольного текста и OCR-гомоглифы в ключах сверки:
+    # «МС 4х2х0,52 ОЛ-И» (спец) == «MC 4х2x0,52 0L-IY» (журнал CAD-экспорта)
+    from app.services.checks import _cable_key, _strip_section_from_mark, check_spec_journal_names
+    assert_true(
+        _strip_section_from_mark("MC 4х2x0,52 0L-IY") == _strip_section_from_mark("МС 4х2х0,52 ОЛ-И"),
+        (_strip_section_from_mark("MC 4х2x0,52 0L-IY"), _strip_section_from_mark("МС 4х2х0,52 ОЛ-И")),
+    )
+    spec = [
+        {"pos": "12", "name": "Кабель монтажный симметричный", "mark": "МС 4х2х0,52 ОЛ-И",
+         "type": "", "manufacturer": "", "note": "", "qty": 150.0, "length": 150.0, "unit": "м",
+         "section": None, "from": "", "to": "", "laying": "", "sheet": "p5_t1"},
+    ]
+    jour = [
+        {"pos": "LAN1.26", "name": "MC 4х2x0,52 0L-IY", "mark": "MC 4х2x0,52 0L-IY", "type": "",
+         "manufacturer": "", "note": "", "qty": None, "length": 60.0, "unit": "м",
+         "section": None, "from": "Шкаф ЛВС", "to": "Розетка ИР1.26", "is_total": False, "sheet": "p6_journal"},
+    ]
+    res = check_spec_journal_names(spec, jour)
+    titles = [f["title"] for f in res["findings"]]
+    assert_true(not any("не найдена" in t or "отсутствует" in t for t in titles), titles)
+    assert_true(not any("не встретился" in t for t in titles), titles)
+    k1, k2 = _cable_key(spec[0]), _cable_key(jour[0])
+    assert_true(k1.split("|")[0] == k2.split("|")[0], (k1, k2))
+    print("OK parser wrapping+homo")
+
 
 def test_cloud_models_api():
     """CRUD своих облачных моделей через API + попадание в каталог /api/models."""

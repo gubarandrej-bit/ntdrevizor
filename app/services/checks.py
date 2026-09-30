@@ -15,6 +15,7 @@ from app.util import (
     is_fire_resistant_mark,
     loads,
     looks_like_cable,
+    mark_ocr_fold,
     norm,
     parse_float,
     parse_section,
@@ -378,10 +379,13 @@ def _cable_brand(i: dict) -> str:
 def _strip_section_from_mark(mark: str) -> str:
     """Убирает полный токен сечения из марки: '3x2.5', '3х2,5', '1x2x0,75',
     '2x2x0,78' (и любые цепочки NxNx…) и суффикс «ТУ …», чтобы журнал
-    и спецификация сходились."""
+    и спецификация сходились. Затем — OCR-фолдинг гомоглифов («0L-IY» ↔ «ОЛ-И»)."""
     t = compact_mark(mark)
+    # сначала OCR-фолдинг: хвосты вида «…0,520L-IY» иначе слипаются с числом
+    # сечения и greedy- regex съедает «0,520» целиком — стороны разойдутся
+    t = mark_ocr_fold(t)
     # полный токен: одна или несколько групп «число x число» подряд
-    t = re.sub(r"\d+(?:[.,]\d+)?(?:[xх×]\d+(?:[.,]\d+)?)+", "", t)
+    t = re.sub(r"\d+(?:[.,]\d+)?(?:[xх×*]\d+(?:[.,]\d+)?)+", "", t)
     t = re.sub(r"\d+(?:[.,]\d+)?мм2?", "", t)
     t = re.sub(r"ту\d+[-.\w]*", "", t)
     return t
